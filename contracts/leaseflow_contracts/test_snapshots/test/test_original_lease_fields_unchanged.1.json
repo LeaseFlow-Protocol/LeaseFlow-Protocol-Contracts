@@ -53,15 +53,7 @@
                               "symbol": "amount"
                             },
                             "val": {
-                              "i128": "1000"
-                            }
-                          },
-                          {
-                            "key": {
-                              "symbol": "expiry_time"
-                            },
-                            "val": {
-                              "u64": "86400"
+                              "i128": "500"
                             }
                           },
                           {
@@ -74,11 +66,23 @@
                           },
                           {
                             "key": {
+                              "symbol": "nft_contract"
+                            },
+                            "val": "void"
+                          },
+                          {
+                            "key": {
                               "symbol": "tenant"
                             },
                             "val": {
                               "address": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHK3M"
                             }
+                          },
+                          {
+                            "key": {
+                              "symbol": "token_id"
+                            },
+                            "val": "void"
                           }
                         ]
                       }
