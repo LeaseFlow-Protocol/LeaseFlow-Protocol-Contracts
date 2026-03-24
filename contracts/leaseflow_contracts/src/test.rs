@@ -21,6 +21,7 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         tenant: tenant.clone(),
         rent_amount: 1_000,
         deposit_amount: 2_000,
+        security_deposit: 500,
         start_date: START,
         end_date: END,
         rent_paid_through: END,                 // fully paid by default
@@ -28,6 +29,7 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         status: LeaseStatus::Active,
         property_uri: String::from_str(env, "ipfs://QmHash123"),
         rent_per_sec: 0,
+        grace_period_end: END,
         nft_contract: None,
         token_id: None,
         active: true,
@@ -38,6 +40,10 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         flat_fee_applied: false,
         seconds_late_charged: 0,
         rent_paid: 0,
+        expiry_time: END,
+        nft_contract: None,
+        token_id: None,
+        active: true,
         expiry_time: 0,
         buyout_price: None,
         cumulative_payments: 0,
@@ -800,4 +806,217 @@ fn test_buyout_price_not_reached() {
     assert_eq!(lease.cumulative_payments, 2000i128);
     assert!(lease.active);
     assert_eq!(lease.status, LeaseStatus::Active);
+}
+
+// ---------------------------------------------------------------------------
+// conclude_lease tests
+// ---------------------------------------------------------------------------
+
+/// Happy path - landlord concludes lease with no damage deductions, full refund
+#[test]
+fn test_conclude_lease_no_damages_full_refund() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Held; // Reset to Held for conclusion
+    lease.status = LeaseStatus::Active; // Reset to Active
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.conclude_lease(&LEASE_ID, &landlord, &0i128);
+
+    // Assert
+    assert_eq!(result, Ok(500)); // Full security deposit refunded
+    let updated_lease = read_lease(&env, &id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Terminated);
+    assert_eq!(updated_lease.deposit_status, DepositStatus::Settled);
+}
+
+/// Happy path - landlord concludes lease with damage deductions, partial refund
+#[test]
+fn test_conclude_lease_with_damages_partial_refund() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Held; // Reset to Held for conclusion
+    lease.status = LeaseStatus::Active; // Reset to Active
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.conclude_lease(&LEASE_ID, &landlord, &200i128);
+
+    // Assert
+    assert_eq!(result, Ok(300)); // 500 - 200 = 300 refunded
+    let updated_lease = read_lease(&env, &id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Terminated);
+    assert_eq!(updated_lease.deposit_status, DepositStatus::Settled);
+}
+
+/// Returns Unauthorised when tenant tries to conclude lease
+#[test]
+fn test_conclude_lease_tenant_unauthorised() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Held;
+    lease.status = LeaseStatus::Active;
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_conclude_lease(&LEASE_ID, &tenant, &100i128);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::Unauthorised)));
+}
+
+/// Returns LeaseNotExpired when concluding before end_date
+#[test]
+fn test_conclude_lease_before_end_date() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Held;
+    lease.status = LeaseStatus::Active;
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END - 1); // Before end date
+
+    // Act
+    let result = client.try_conclude_lease(&LEASE_ID, &landlord, &0i128);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::LeaseNotExpired)));
+}
+
+/// Returns RentOutstanding when rent is not fully paid
+#[test]
+fn test_conclude_lease_with_outstanding_rent() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Held;
+    lease.status = LeaseStatus::Active;
+    lease.rent_paid_through = END - 1; // Rent not fully paid
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_conclude_lease(&LEASE_ID, &landlord, &0i128);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::RentOutstanding)));
+}
+
+/// Returns InvalidDeduction when damage deduction is negative
+#[test]
+fn test_conclude_lease_negative_deduction() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Held;
+    lease.status = LeaseStatus::Active;
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_conclude_lease(&LEASE_ID, &landlord, &-100i128);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::InvalidDeduction)));
+}
+
+/// Returns InvalidDeduction when damage deduction exceeds security deposit
+#[test]
+fn test_conclude_lease_excessive_deduction() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Held;
+    lease.status = LeaseStatus::Active;
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_conclude_lease(&LEASE_ID, &landlord, &600i128); // More than 500 deposit
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::InvalidDeduction)));
+}
+
+/// Returns LeaseNotFound for non-existent lease
+#[test]
+fn test_conclude_lease_not_found() {
+    // Arrange
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_conclude_lease(&99u64, &landlord, &0i128);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::LeaseNotFound)));
+}
+
+/// Test create_lease_instance with security_deposit
+#[test]
+fn test_create_lease_instance_with_security_deposit() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 2000,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+    };
+
+    // Act
+    let result = client.create_lease_instance(&LEASE_ID, &landlord, &params);
+
+    // Assert
+    assert_eq!(result, Ok(()));
+    let lease = read_lease(&env, &id, LEASE_ID).unwrap();
+    assert_eq!(lease.landlord, landlord);
+    assert_eq!(lease.tenant, tenant);
+    assert_eq!(lease.security_deposit, 500);
+    assert_eq!(lease.status, LeaseStatus::Pending);
+    assert_eq!(lease.deposit_status, DepositStatus::Held);
 }
