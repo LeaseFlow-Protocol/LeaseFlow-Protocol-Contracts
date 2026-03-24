@@ -2,10 +2,13 @@
 resolver = "2"
 members = [
   "contracts/*",
+  "crates/*",
+  "fuzz",
 ]
 
 [workspace.dependencies]
 soroban-sdk = "25"
+leaseflow_math = { path = "crates/leaseflow_math" }
 
 [profile.release]
 opt-level = "z"

@@ -1,444 +1,314 @@
 #![cfg(test)]
+extern crate std;
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Address, Env, BytesN, String};
-use crate::LeaseContractClient;
-
-#[test]
-fn test_lease_initialization() {
-use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Env};
-
-#[test]
-fn test_lease_and_late_fees() {
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short,
-    testutils::Address as _,
-    Address, Env,
+    testutils::{Address as _, Events, Ledger},
+    Address, Env, Event, String,
 };
 
-// ── Mock NFT Contract ─────────────────────────────────────────────────────────
-//
-// This pretends to be a real NFT contract for testing purposes.
-// It records the last transfer so we can assert it happened correctly.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
-#[contract]
-pub struct MockNftContract;
+const LEASE_ID: u64 = 1;
+const START: u64 = 1_000_000;
+const END: u64 = 2_000_000;
 
-// We store the last transfer details in contract storage so the test can read them.
-#[contracttype]
-pub struct TransferRecord {
-    pub from: Address,
-    pub to: Address,
-    pub token_id: u128,
+fn make_env() -> Env {
+    let env = Env::default();
+    env.mock_all_auths();
+    env
 }
 
-#[contractimpl]
-impl MockNftContract {
-    pub fn transfer_from(
-        env: Env,
-        _spender: Address, // we ignore spender in the mock, a real contract would check it
-        from: Address,
-        to: Address,
-        token_id: u128,
-    ) {
-        // Record the transfer so we can assert on it in the test
-        env.storage().instance().set(
-            &symbol_short!("last_xfr"),
-            &TransferRecord { from, to, token_id },
-        );
-    }
-
-    // Helper to read back the last recorded transfer
-    pub fn get_last_transfer(env: Env) -> TransferRecord {
-        env.storage()
-            .instance()
-            .get(&symbol_short!("last_xfr"))
-            .expect("No transfer recorded")
+fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance {
+    LeaseInstance {
+        landlord: landlord.clone(),
+        tenant: tenant.clone(),
+        rent_amount: 1_000,
+        deposit_amount: 2_000,
+        start_date: START,
+        end_date: END,
+        rent_paid_through: END,                 // fully paid by default
+        deposit_status: DepositStatus::Settled, // settled by default
+        status: LeaseStatus::Active,
+        property_uri: String::from_str(env, "ipfs://QmHash123"),
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-use soroban_sdk::{symbol_short, testutils::Address as _, Address, Env};
+/// Register the contract and return (contract_id, client).
+fn setup(env: &Env) -> (Address, LeaseContractClient<'_>) {
+    let id = env.register(LeaseContract, ());
+    let client = LeaseContractClient::new(env, &id);
+    (id, client)
+}
+
+/// Seed a LeaseInstance directly into contract storage (bypasses auth).
+fn seed_lease(env: &Env, contract_id: &Address, lease_id: u64, lease: &LeaseInstance) {
+    env.as_contract(contract_id, || save_lease(env, lease_id, lease));
+}
+
+/// Read a LeaseInstance directly from contract storage.
+fn read_lease(env: &Env, contract_id: &Address, lease_id: u64) -> Option<LeaseInstance> {
+    env.as_contract(contract_id, || load_lease(env, lease_id))
+}
+
+// ---------------------------------------------------------------------------
+// Legacy test (preserved)
+// ---------------------------------------------------------------------------
 
 #[test]
-fn test_lease_with_nft() {
-    let env = Env::default();
-    // In tests we need to disable auth checks so require_auth() doesn't fail
-    env.mock_all_auths();
-
-    // Deploy the mock NFT contract
-    let nft_id = env.register(MockNftContract, ());
-    let nft_client = MockNftContractClient::new(&env, &nft_id);
-
-    // Deploy the lease contract
-    let lease_id = env.register(LeaseContract, ());
-    let lease_client = LeaseContractClient::new(&env, &lease_id);
+fn test_lease() {
+    let env = make_env();
+    let (_, client) = setup(&env);
 
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
-    let rent_amount = 1000i128;
-    let deposit_amount = 2000i128;
-    let start_date = 1640995200u64; // Jan 1, 2022
-    let end_date = 1672531200u64; // Jan 1, 2023
-    let property_uri = String::from_str(&env, "ipfs://QmHash123");
 
-    client.initialize_lease(
-        &landlord,
-        &tenant,
-        &rent_amount,
-        &deposit_amount,
-        &start_date,
-        &end_date,
-        &property_uri,
-    );
-    
+    client.create_lease(&landlord, &tenant, &1000i128);
     let lease = client.get_lease();
+
     assert_eq!(lease.landlord, landlord);
     assert_eq!(lease.tenant, tenant);
-    assert_eq!(lease.rent_amount, rent_amount);
-    assert_eq!(lease.deposit_amount, deposit_amount);
-    assert_eq!(lease.start_date, start_date);
-    assert_eq!(lease.end_date, end_date);
-    assert_eq!(lease.property_uri, property_uri);
-    assert_eq!(lease.status, LeaseStatus::Pending);
-}
-
-#[test]
-fn test_lease_activation() {
-    let env = Env::default();
-    let contract_id = env.register(LeaseContract, ());
-    let client = LeaseContractClient::new(&env, &contract_id);
-
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-    let rent_amount = 1000i128;
-    let deposit_amount = 2000i128;
-    let start_date = 1640995200u64;
-    let end_date = 1672531200u64;
-    let property_uri = String::from_str(&env, "ipfs://QmHash123");
-
-    client.initialize_lease(
-        &landlord,
-        &tenant,
-        &rent_amount,
-        &deposit_amount,
-        &start_date,
-        &end_date,
-        &property_uri,
-    );
-    
-    // Activate lease
-    client.activate_lease(&tenant);
-    
-    let lease = client.get_lease();
-    assert_eq!(lease.status, LeaseStatus::Active);
-}
-
-#[test]
-fn test_property_uri_update() {
-    let env = Env::default();
-    let contract_id = env.register(LeaseContract, ());
-    let client = LeaseContractClient::new(&env, &contract_id);
-
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-    let rent_amount = 1000i128;
-    let deposit_amount = 2000i128;
-    let start_date = 1640995200u64;
-    let end_date = 1672531200u64;
-    let property_uri = String::from_str(&env, "ipfs://QmHash123");
-
-    client.initialize_lease(
-        &landlord,
-        &tenant,
-        &rent_amount,
-        &deposit_amount,
-        &start_date,
-        &end_date,
-        &property_uri,
-    );
-    
-    // Update property URI
-    let new_property_uri = String::from_str(&env, "ipfs://QmNewHash456");
-    client.update_property_uri(&landlord, &new_property_uri);
-    
-    let lease = client.get_lease();
-    assert_eq!(lease.property_uri, new_property_uri);
-}
-
-#[test]
-fn test_lease_amendment() {
-    let env = Env::default();
-    let contract_id = env.register(LeaseContract, ());
-    let client = LeaseContractClient::new(&env, &contract_id);
-
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-    let rent_amount = 1000i128;
-    let deposit_amount = 2000i128;
-    let start_date = 1640995200u64;
-    let end_date = 1672531200u64;
-    let property_uri = String::from_str(&env, "ipfs://QmHash123");
-
-    client.initialize_lease(
-        &landlord,
-        &tenant,
-        &rent_amount,
-        &deposit_amount,
-        &start_date,
-        &end_date,
-        &property_uri,
-    );
-    
-    client.activate_lease(&tenant);
-    
-    // Create amendment with new rent and end date
-    let new_rent = Some(1200i128);
-    let new_end_date = Some(1704067200u64); // Jan 1, 2024
-    let landlord_sig = BytesN::from_array(&env, &[1u8; 32]);
-    let tenant_sig = BytesN::from_array(&env, &[2u8; 32]);
-    
-    let amendment = LeaseAmendment {
-        new_rent_amount: new_rent,
-        new_end_date: new_end_date,
-        landlord_signature: landlord_sig,
-        tenant_signature: tenant_sig,
-    };
-    
-    client.amend_lease(&amendment);
-    
-    let lease = client.get_lease();
-    assert_eq!(lease.rent_amount, 1200i128);
-    assert_eq!(lease.end_date, 1704067200u64);
-}
-
-#[test]
-fn test_deposit_release_full_refund() {
-    let env = Env::default();
-    let contract_id = env.register(LeaseContract, ());
-    let client = LeaseContractClient::new(&env, &contract_id);
-
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-    let rent_amount = 1000i128;
-    let deposit_amount = 2000i128;
-    let start_date = 1640995200u64;
-    let end_date = 1672531200u64;
-    let property_uri = String::from_str(&env, "ipfs://QmHash123");
-
-    client.initialize_lease(
-        &landlord,
-        &tenant,
-        &rent_amount,
-        &deposit_amount,
-        &start_date,
-        &end_date,
-        &property_uri,
-    );
-    
-    client.activate_lease(&tenant);
-    
-    // Release full deposit
-    let release = DepositRelease::FullRefund;
-    client.release_deposit(&release);
-}
-
-#[test]
-fn test_deposit_release_partial_refund() {
-    let env = Env::default();
-    let contract_id = env.register(LeaseContract, ());
-    let client = LeaseContractClient::new(&env, &contract_id);
-
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-    let rent_amount = 1000i128;
-    let deposit_amount = 2000i128;
-    let start_date = 1640995200u64;
-    let end_date = 1672531200u64;
-    let property_uri = String::from_str(&env, "ipfs://QmHash123");
-
-    client.initialize_lease(
-        &landlord,
-        &tenant,
-        &rent_amount,
-        &deposit_amount,
-        &start_date,
-        &end_date,
-        &property_uri,
-    );
-    
-    client.activate_lease(&tenant);
-    
-    // Release partial deposit
-    let partial = DepositReleasePartial {
-        tenant_amount: 1500i128,
-        landlord_amount: 500i128,
-    };
-    let release = DepositRelease::PartialRefund(partial);
-    client.release_deposit(&release);
-}
-
-#[test]
-fn test_deposit_release_disputed() {
-    let env = Env::default();
-    let contract_id = env.register(LeaseContract, ());
-    let client = LeaseContractClient::new(&env, &contract_id);
-
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-    let rent_amount = 1000i128;
-    let deposit_amount = 2000i128;
-    let start_date = 1640995200u64;
-    let end_date = 1672531200u64;
-    let property_uri = String::from_str(&env, "ipfs://QmHash123");
-
-    client.initialize_lease(
-        &landlord,
-        &tenant,
-        &rent_amount,
-        &deposit_amount,
-        &start_date,
-        &end_date,
-        &property_uri,
-    );
-    
-    client.activate_lease(&tenant);
-    
-    // Mark deposit as disputed
-    let release = DepositRelease::Disputed;
-    client.release_deposit(&release);
-    
-    let lease = client.get_lease();
-    assert_eq!(lease.status, LeaseStatus::Disputed);
-    let token_id: u128 = 42;
-    let rent_amount: i128 = 1000;
-
-    // Create the lease — this should trigger transfer_from on the mock NFT
-    lease_client.create_lease_with_nft(
-    &landlord,
-    &tenant,
-    &rent_amount,
-    &nft_id,
-    &token_id,
-);
-    let lease_id = symbol_short!("lease");
-    let amount = 1000i128;
-    let grace_period_end = 100_000u64;
-    let late_fee_flat = 20i128;
-    let late_fee_per_day = 5i128;
-
-    client.create_lease(
-        &landlord,
-        &tenant,
-        &amount,
-        &grace_period_end,
-        &late_fee_flat,
-        &late_fee_per_day,
-    );
-
-    let lease = client.get_lease();
     assert_eq!(lease.amount, 1000);
-    assert_eq!(lease.debt, 0);
+    assert!(lease.active);
+}
 
-    // Time travels to 2 days later after grace period 
-    // Wait, let's explicitly set the ledger
-    // 2 days = 172800 secs. Let's add 176400 to make it exactly 2 full days and some balance.
-    env.ledger().with_mut(|li| {
-        li.timestamp = 100_000 + 176400; 
+// ---------------------------------------------------------------------------
+// terminate_lease tests
+// ---------------------------------------------------------------------------
+
+/// Happy path — expired, fully paid, settled lease is removed from storage.
+#[test]
+fn test_terminate_lease_success_deletes_storage() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert
+    assert_eq!(result, ());
+    assert!(read_lease(&env, &id, LEASE_ID).is_none());
+}
+
+/// Returns LeaseNotExpired when called before end_date.
+#[test]
+fn test_terminate_lease_before_end_date_fails() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+    env.ledger().with_mut(|l| l.timestamp = END - 1); // still active
+
+    // Act
+    let result = client.try_terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::LeaseNotExpired)));
+}
+
+/// Returns RentOutstanding when rent has not been paid through end_date.
+#[test]
+fn test_terminate_lease_with_outstanding_rent_fails() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.rent_paid_through = END - 1; // one second short
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::RentOutstanding)));
+}
+
+/// Returns DepositNotSettled when deposit is still Held.
+#[test]
+fn test_terminate_lease_with_unsettled_deposit_fails() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Held;
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::DepositNotSettled)));
+}
+
+/// Returns DepositNotSettled when deposit is Disputed.
+#[test]
+fn test_terminate_lease_with_disputed_deposit_fails() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_status = DepositStatus::Disputed;
+    seed_lease(&env, &id, LEASE_ID, &lease);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::DepositNotSettled)));
+}
+
+/// Returns Unauthorised for a caller that is neither landlord, tenant, nor admin.
+#[test]
+fn test_terminate_lease_unauthorised_caller_fails() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let stranger = Address::generate(&env);
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.try_terminate_lease(&LEASE_ID, &stranger);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::Unauthorised)));
+}
+
+/// Returns LeaseNotFound for a non-existent lease ID.
+#[test]
+fn test_terminate_lease_not_found_fails() {
+    // Arrange
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let caller = Address::generate(&env);
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act — no lease stored
+    let result = client.try_terminate_lease(&99u64, &caller);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::LeaseNotFound)));
+}
+
+/// Confirms the lease.terminated event is published on successful termination.
+#[test]
+fn test_terminate_lease_emits_terminated_event() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    client.terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert — the LeaseTerminated event must have been emitted.
+    let expected = LeaseTerminated { lease_id: LEASE_ID };
+    assert_eq!(
+        env.events().all(),
+        std::vec![expected.to_xdr(&env, &id)],
+    );
+}
+
+/// Tenant can also invoke termination (not just landlord).
+#[test]
+fn test_terminate_lease_tenant_can_terminate() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act
+    let result = client.terminate_lease(&LEASE_ID, &tenant);
+
+    // Assert
+    assert_eq!(result, ());
+    assert!(read_lease(&env, &id, LEASE_ID).is_none());
+}
+
+/// Termination is idempotent — second call returns LeaseNotFound.
+#[test]
+fn test_terminate_lease_idempotent() {
+    // Arrange
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    seed_lease(&env, &id, LEASE_ID, &make_lease(&env, &landlord, &tenant));
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+    client.terminate_lease(&LEASE_ID, &landlord);
+
+    // Act — second call
+    let result = client.try_terminate_lease(&LEASE_ID, &landlord);
+
+    // Assert
+    assert_eq!(result, Err(Ok(LeaseError::LeaseNotFound)));
+}
+
+/// archive_lease helper moves the entry to persistent HistoricalLease storage.
+#[test]
+fn test_terminate_archived_lease_moves_to_historical() {
+    // Arrange
+    let env = make_env();
+    let (id, _) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let lease = make_lease(&env, &landlord, &tenant);
+
+    env.ledger().with_mut(|l| l.timestamp = END + 1);
+
+    // Act — call archive_lease inside the contract context
+    env.as_contract(&id, || {
+        save_lease(&env, LEASE_ID, &lease);
+        archive_lease(&env, LEASE_ID, lease.clone(), landlord.clone());
     });
 
-    // Make a partial payment that covers part of the debt but no rent.
-    // Flat fee $20 + (2 days * $5) = $30. Let's pay 25.
-    client.pay_rent(&25);
+    // Assert — active storage cleared
+    assert!(read_lease(&env, &id, LEASE_ID).is_none());
 
-    let updated_lease1 = client.get_lease();
-    assert_eq!(updated_lease1.debt, 5);
-    assert_eq!(updated_lease1.rent_paid, 0);
-    assert_eq!(updated_lease1.flat_fee_applied, true);
-    assert_eq!(updated_lease1.days_late_charged, 2);
+    // Assert — historical record exists in persistent storage
+    let record: HistoricalLease = env.as_contract(&id, || {
+        env.storage()
+            .persistent()
+            .get(&DataKey::HistoricalLease(LEASE_ID))
+            .expect("HistoricalLease not found")
+    });
 
-    // Pay enough to clear the rest of debt and the full rent.
-    // Remaining Debt = 5. Rent = 1000. Total = 1005.
-    client.pay_rent(&1005);
-    
-    let updated_lease2 = client.get_lease();
-    assert_eq!(updated_lease2.debt, 0);
-    assert_eq!(updated_lease2.rent_paid, 0); // resets because rent was fully paid
-    assert_eq!(updated_lease2.grace_period_end, 100_000 + 2592000);
-    assert_eq!(updated_lease2.flat_fee_applied, false);
-    assert_eq!(updated_lease2.days_late_charged, 0);
-    let duration = 86_400u64; // 1 day
-
-    client.create_lease(&lease_id, &landlord, &tenant, &amount, &duration);
-    let lease = client.get_lease(&lease_id);
-
-    // ── Assert: lease was stored correctly ────────────────────────────────────
-    let lease = lease_client.get_lease();
-    assert_eq!(lease.landlord, landlord);
-    assert_eq!(lease.tenant, tenant);
-    assert_eq!(lease.amount, rent_amount);
-    assert_eq!(lease.nft_contract, Some(nft_id.clone()));
-    assert_eq!(lease.token_id, Some(token_id));
-    assert!(lease.active);
-
-    // ── Assert: transfer_from was called with the right arguments ─────────────
-    // This is the key acceptance criterion: verify transfer_from works correctly
-    let transfer = nft_client.get_last_transfer();
-    assert_eq!(transfer.from, landlord,   "NFT should move FROM the landlord");
-    assert_eq!(transfer.to, tenant,       "NFT should move TO the tenant");
-    assert_eq!(transfer.token_id, token_id, "Token ID should match");
-    assert_eq!(lease.expiry_time, duration); // ledger timestamp starts at 0 in tests
-}
-
-#[test]
-fn test_add_funds() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register(LeaseContract, ());
-    let client = LeaseContractClient::new(&env, &contract_id);
-
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-    let lease_id = symbol_short!("lease1");
-    let initial_amount = 1000i128;
-    let duration = 86_400u64; // 1 day
-
-    client.create_lease(&lease_id, &landlord, &tenant, &initial_amount, &duration);
-
-    let before = client.get_lease(&lease_id);
-    let added_amount = 500i128;
-
-    client.add_funds(&lease_id, &added_amount);
-
-    let after = client.get_lease(&lease_id);
-
-    assert_eq!(after.amount, initial_amount + added_amount);
-    assert_eq!(
-        after.expiry_time,
-        before.expiry_time + (added_amount as u64 * SECS_PER_UNIT)
-    );
-    assert_eq!(after.landlord, landlord);
-    assert_eq!(after.tenant, tenant);
-    assert!(after.active);
-}
-
-#[test]
-fn test_original_lease_fields_unchanged() {
-    let env = Env::default();
-
-    let lease_id = env.register(LeaseContract, ());
-    let client = LeaseContractClient::new(&env, &lease_id);
-
-    let landlord = Address::generate(&env);
-    let tenant = Address::generate(&env);
-
-    client.create_lease(&landlord, &tenant, &500i128);
-
-    let lease = client.get_lease();
-    assert_eq!(lease.landlord, landlord);
-    assert_eq!(lease.tenant, tenant);
-    assert_eq!(lease.amount, 500);
-    assert!(lease.active);
-    assert_eq!(lease.nft_contract, None);
-    assert_eq!(lease.token_id, None);
+    assert_eq!(record.lease, lease);
+    assert_eq!(record.terminated_by, landlord);
+    assert_eq!(record.terminated_at, END + 1);
 }
