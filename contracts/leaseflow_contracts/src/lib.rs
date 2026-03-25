@@ -566,6 +566,10 @@ impl LeaseContract {
             expiry_time: params.end_date,
             buyout_price: None,
             cumulative_payments: 0,
+            rent_per_sec: params.rent_per_sec,
+            grace_period_end: params.grace_period_end,
+            late_fee_flat: params.late_fee_flat,
+            late_fee_per_sec: params.late_fee_per_sec,
             rent_per_sec: 0,
             grace_period_end: params.end_date,
             late_fee_flat: 0,
@@ -964,6 +968,49 @@ impl LeaseContract {
         save_lease(&env, lease_id, &lease);
 
         Ok(refund_amount)
+    }
+
+    /// Checks the tenant's payment status, updates the total debt,
+    /// and triggers an EvictionEligible event if debt exceeds 2 months of rent.
+    pub fn check_tenant_default(env: Env, lease_id: u64) -> Result<i128, LeaseError> {
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        let current_time = env.ledger().timestamp();
+        
+        let elapsed_secs = current_time.saturating_sub(lease.start_date);
+        let expected_rent = (elapsed_secs as i128).saturating_mul(lease.rent_per_sec);
+        let unpaid_rent = expected_rent.saturating_sub(lease.rent_paid);
+        let mut total_debt = if unpaid_rent > 0 { unpaid_rent } else { 0 };
+
+        if current_time > lease.grace_period_end {
+            let seconds_late = current_time - lease.grace_period_end;
+
+            if !lease.flat_fee_applied {
+                lease.debt += lease.late_fee_flat;
+                lease.flat_fee_applied = true;
+            }
+
+            if seconds_late > lease.seconds_late_charged {
+                let newly_accrued = seconds_late - lease.seconds_late_charged;
+                lease.debt += (newly_accrued as i128) * lease.late_fee_per_sec;
+                lease.seconds_late_charged = seconds_late;
+            }
+        }
+        
+        total_debt += lease.debt;
+
+        // Assuming rent_amount represents 1 month of rent natively in the protocol
+        let eviction_threshold = lease.rent_amount.saturating_mul(2);
+        
+        if total_debt >= eviction_threshold {
+            EvictionEligible {
+                lease_id,
+                tenant: lease.tenant.clone(),
+                debt: total_debt,
+            }.publish(&env);
+        }
+
+        save_lease(&env, lease_id, &lease);
+        Ok(total_debt)
     }
 }
 
