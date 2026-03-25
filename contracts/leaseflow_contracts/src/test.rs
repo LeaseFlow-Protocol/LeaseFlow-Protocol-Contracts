@@ -355,6 +355,47 @@ fn test_reclaim_asset_unauthorized() {
     assert_eq!(events.len(), 0);
 }
 
+/// Tests that reclaim successfully terminates the lease and returns the NFT when balance is 0.
+#[test]
+fn test_reclaim_success() {
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_amount = 0; // Simulate dry stream
+    seed_lease(&env, &id, LEASE_ID, &lease);
+
+    let result = client.reclaim(&LEASE_ID, &landlord);
+
+    assert_eq!(result, Ok(()));
+
+    let updated_lease = read_lease(&env, &id, LEASE_ID).unwrap();
+    assert_eq!(updated_lease.status, LeaseStatus::Terminated);
+    assert!(!updated_lease.active);
+    
+    let events = env.events().all();
+    assert!(events.len() > 0); // AssetReclaimed emitted
+}
+
+/// Tests that reclaim fails when deposit_amount is greater than 0.
+#[test]
+fn test_reclaim_fails_when_balance_not_zero() {
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.deposit_amount = 100; // Has balance
+    seed_lease(&env, &id, LEASE_ID, &lease);
+
+    let result = client.try_reclaim(&LEASE_ID, &landlord);
+
+    assert_eq!(result, Err(Ok(LeaseError::DepositNotSettled)));
+}
+
 // ---------------------------------------------------------------------------
 // NFT Escrow Tests
 // ---------------------------------------------------------------------------
