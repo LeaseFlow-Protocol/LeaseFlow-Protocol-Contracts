@@ -103,13 +103,22 @@ pub struct LeaseInstance {
     pub active: bool,
     pub rent_paid: i128,
     pub expiry_time: u64,
-    /// IPFS / HTTP URI pointing to the off-chain lease document.
-    pub property_uri: String,
     /// Optional price at which the tenant can buy out the asset.
     pub buyout_price: Option<i128>,
-    /// Total cumulative payments made by the tenant.
     pub cumulative_payments: i128,
     pub debt: i128,
+    pub rent_paid_through: u64,
+    pub deposit_status: DepositStatus,
+    pub rent_per_sec: i128,
+    pub grace_period_end: u64,
+    pub late_fee_flat: i128,
+    pub late_fee_per_sec: i128,
+    pub flat_fee_applied: bool,
+    pub seconds_late_charged: u64,
+    /// Pre-approved destination for landlord's rent withdrawals.
+    pub withdrawal_address: Option<Address>,
+    /// Total rent withdrawn by the landlord.
+    pub rent_withdrawn: i128,
 }
 
 #[contracttype]
@@ -222,6 +231,7 @@ pub enum LeaseError {
     NftNotReturned = 8,
     UsageRightsNotFound = 9,
     UsageRightsExpired = 10,
+    WithdrawalAddressNotSet = 11,
 }
 // ── Storage Helpers ───────────────────────────────────────────────────────────
 
@@ -639,25 +649,22 @@ impl LeaseContract {
             deposit_status: DepositStatus::Held,
             status: LeaseStatus::Pending,
             property_uri: params.property_uri,
-            rent_per_sec: 0,
-            grace_period_end: params.end_date,
             nft_contract: None,
             token_id: None,
             active: true,
-            grace_period_end: 0,
-            late_fee_flat: 0,
-            late_fee_per_sec: 0,
             debt: 0,
-            flat_fee_applied: false,
-            seconds_late_charged: 0,
             rent_paid: 0,
             expiry_time: params.end_date,
-            nft_contract: None,
-            token_id: None,
-            active: true,
-            expiry_time: 0,
             buyout_price: None,
             cumulative_payments: 0,
+            rent_per_sec: 0,
+            grace_period_end: params.end_date,
+            late_fee_flat: 0,
+            late_fee_per_sec: 0,
+            flat_fee_applied: false,
+            seconds_late_charged: 0,
+            withdrawal_address: None,
+            rent_withdrawn: 0,
         };
         save_lease(&env, lease_id, &lease);
         Ok(())
@@ -732,6 +739,72 @@ impl LeaseContract {
         }
         
         save_lease(&env, lease_id, &lease);
+        Ok(())
+    }
+
+    /// Sets the pre-approved withdrawal address for the landlord.
+    /// Only the landlord can call this function.
+    pub fn set_withdrawal_address(
+        env: Env,
+        lease_id: u64,
+        withdrawal_address: Address,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // Authorize landlord
+        lease.landlord.require_auth();
+
+        lease.withdrawal_address = Some(withdrawal_address);
+        save_lease(&env, lease_id, &lease);
+        Ok(())
+    }
+
+    /// Landlord withdraws accumulated rent to the pre-approved address.
+    ///
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `lease_id` - Unique identifier of the lease
+    /// * `token_contract_id` - The asset ID of the rent token to withdraw
+    ///
+    /// # Errors
+    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
+    /// * `LeaseError::Unauthorised` - Caller is not the landlord
+    /// * `LeaseError::WithdrawalAddressNotSet` - Withdrawal address has not been set
+    ///
+    /// # Panics
+    /// Panics if there are no funds to withdraw.
+    pub fn withdraw_rent(
+        env: Env,
+        lease_id: u64,
+        token_contract_id: Address,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // Authorize landlord
+        lease.landlord.require_auth();
+
+        let withdrawal_address = lease
+            .withdrawal_address
+            .clone()
+            .ok_or(LeaseError::WithdrawalAddressNotSet)?;
+
+        let withdrawable_amount = lease.rent_paid - lease.rent_withdrawn;
+        if withdrawable_amount <= 0 {
+            panic!("No rent to withdraw");
+        }
+
+        // Transfer funds
+        let token_client = soroban_sdk::token::Client::new(&env, &token_contract_id);
+        token_client.transfer(
+            &env.current_contract_address(),
+            &withdrawal_address,
+            &withdrawable_amount,
+        );
+
+        // Update state
+        lease.rent_withdrawn += withdrawable_amount;
+        save_lease(&env, lease_id, &lease);
+
         Ok(())
     }
 
