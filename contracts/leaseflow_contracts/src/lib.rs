@@ -243,6 +243,9 @@ pub enum LeaseError {
     UsageRightsNotFound = 8,
     UsageRightsExpired = 9,
     KycRequired = 10,
+    NftNotReturned = 8,
+    UsageRightsNotFound = 9,
+    UsageRightsExpired = 10,
 }
 
 
@@ -587,6 +590,88 @@ impl LeaseContract {
     pub fn submit_repair_proof(env: Env, lease_id: u64, landlord: Address, proof_hash: BytesN<32>) -> Result<(), LeaseError> {
         let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         if lease.landlord != landlord { return Err(LeaseError::Unauthorised); }
+    /// Reclaims an asset when the renter's payment stream runs dry (balance == 0).
+    pub fn reclaim(
+        env: Env,
+        lease_id: u64,
+        caller: Address,
+    ) -> Result<(), LeaseError> {
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        let is_landlord = caller == lease.landlord;
+        let is_admin = env
+            .storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .map(|admin| admin == caller)
+            .unwrap_or(false);
+
+        if !is_landlord && !is_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        caller.require_auth();
+
+        // Check renter_balance (deposit_amount == 0 implies stream is dry)
+        if lease.deposit_amount > 0 {
+            return Err(LeaseError::DepositNotSettled);
+        }
+
+        // If 0, transfer Asset NFT back to owner.
+        if let (Some(nft_contract_addr), Some(token_id)) = (lease.nft_contract.clone(), lease.token_id) {
+            delete_usage_rights(&env, nft_contract_addr.clone(), token_id);
+            
+            let nft_client = nft_contract::NftClient::new(&env, &nft_contract_addr);
+            nft_client.transfer_from(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &lease.landlord,
+                &token_id,
+            );
+        }
+
+        // Mark lease as Terminated.
+        lease.status = LeaseStatus::Terminated;
+        lease.active = false;
+        
+        save_lease(&env, lease_id, &lease);
+
+        AssetReclaimed {
+            id: lease_id,
+            reason: String::from_str(&env, "Payment stream ran dry"),
+        }.publish(&env);
+
+        Ok(())
+    }
+
+    /// Concludes a lease and processes security deposit refund with damage deductions.
+    /// Only the landlord can call this function to approve the return and specify damage deductions.
+    /// 
+    /// # Arguments
+    /// * `env` - The Soroban environment
+    /// * `lease_id` - Unique identifier of the lease to conclude
+    /// * `damage_deduction` - Amount to deduct from security deposit for damages
+    /// 
+    /// # Errors
+    /// * `LeaseError::LeaseNotFound` - No lease exists for the given ID
+    /// * `LeaseError::Unauthorised` - Caller is not the landlord
+    /// * `LeaseError::LeaseNotExpired` - Lease has not yet expired
+    /// * `LeaseError::RentOutstanding` - Rent has not been paid through end_date
+    /// 
+    /// # Returns
+    /// Returns the refund amount (security_deposit - damage_deduction) to be returned to tenant
+    pub fn conclude_lease(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        damage_deduction: i128,
+    ) -> Result<i128, LeaseError> {
+        // 1. Load lease
+        let mut lease = load_lease(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // 2. Authorisation - only landlord can conclude lease
+        if landlord != lease.landlord {
+            return Err(LeaseError::Unauthorised);
+        }
         landlord.require_auth();
         require!(lease.maintenance_status == MaintenanceStatus::Reported, "No issue reported");
         lease.repair_proof_hash = Some(proof_hash.clone());
