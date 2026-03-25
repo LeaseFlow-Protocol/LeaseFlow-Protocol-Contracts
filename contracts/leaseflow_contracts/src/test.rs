@@ -3,7 +3,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
-    Address, Env, String, Symbol, symbol_short, BytesN,
+    Address, Env, String, Symbol, symbol_short, BytesN, contract, contractimpl,
 };
 use crate::{LeaseContract, LeaseContractClient, LeaseStatus, MaintenanceStatus, DepositStatus, CreateLeaseParams, RateType, HistoricalLease, DataKey, 
     MaintenanceIssueReported, RepairProofSubmitted, MaintenanceVerified, LeaseStarted, LeaseTerminated, DepositReleasePartial};
@@ -11,6 +11,20 @@ use crate::{LeaseContract, LeaseContractClient, LeaseStatus, MaintenanceStatus, 
 const START: u64 = 1711929600; 
 const END: u64 = 1714521600;   
 const LEASE_ID: u64 = 1;
+
+// --- KYC Mock ---
+#[contract]
+pub struct KycMock;
+
+#[contractimpl]
+impl KycMock {
+    pub fn is_verified(env: Env, address: Address) -> bool {
+        env.storage().instance().get(&address).unwrap_or(false)
+    }
+    pub fn set_verified(env: Env, address: Address, status: bool) {
+        env.storage().instance().set(&address, &status);
+    }
+}
 
 fn make_env() -> Env {
     let env = Env::default();
@@ -60,6 +74,34 @@ fn read_lease(env: &Env, contract_id: &Address, lease_id: u64) -> Option<LeaseIn
 }
 
 #[test]
+fn test_kyc_requirement() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let admin = Address::generate(&env);
+    let kyc_id = env.register(KycMock, ());
+    let kyc_client = KycMockClient::new(&env, &kyc_id);
+
+    client.set_admin(&admin);
+    client.set_kyc_provider(&admin, &kyc_id);
+
+    // Initial attempt should fail (no KYC)
+    let lease_id = symbol_short!("lease1");
+    let res = client.try_initialize_lease(&lease_id, &landlord, &tenant, &5000, &10000, &31536000, &String::from_str(&env, "ipfs://test"));
+    assert!(res.is_err());
+
+    // Verify both
+    kyc_client.set_verified(&landlord, &true);
+    kyc_client.set_verified(&tenant, &true);
+
+    // Success
+    client.initialize_lease(&lease_id, &landlord, &tenant, &5000, &10000, &31536000, &String::from_str(&env, "ipfs://test"));
+    let lease = client.get_lease(&lease_id);
+    assert_eq!(lease.status, LeaseStatus::Pending);
+}
+
+#[test]
 fn test_lease_basic() {
     let env = make_env();
     let (_, client) = setup(&env);
@@ -68,6 +110,7 @@ fn test_lease_basic() {
     let landlord = Address::generate(&env);
     let tenant = Address::generate(&env);
     
+    // KYC not enabled by default, should work
     client.initialize_lease(&lease_id, &landlord, &tenant, &5000, &10000, &31536000, &String::from_str(&env, "ipfs://test"));
     let lease = client.get_lease(&lease_id);
     assert_eq!(lease.status, LeaseStatus::Pending);
