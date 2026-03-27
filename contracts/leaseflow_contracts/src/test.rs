@@ -118,12 +118,18 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         paused_at: None,
         pause_initiator: None,
         total_paused_duration: 0,
-        // Other missing fields
-        payment_token: Address::generate(env),
-        maintenance_status: MaintenanceStatus::None,
-        withheld_rent: 0,
-        inspector: None,
-        repair_proof_hash: None,
+        rent_pull_authorized_amount: None,
+        last_rent_pull_timestamp: None,
+        billing_cycle_duration: 2_592_000,
+        // New Features
+        yield_delegation_enabled: false,
+        yield_accumulated: 0,
+        equity_balance: 0,
+        equity_percentage_bps: 0,
+        had_late_payment: false,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
     }
 }
 
@@ -614,6 +620,11 @@ fn test_maintenance_flow_with_events() {
         grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -656,6 +667,11 @@ fn test_batch_withdraw_rent_aggregates_payout() {
         grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
     };
 
     let params_2 = CreateLeaseParams {
@@ -672,6 +688,11 @@ fn test_batch_withdraw_rent_aggregates_payout() {
         grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
     };
 
     client.create_lease_instance(&lease_id_1, &landlord, &params_1);
@@ -729,6 +750,11 @@ fn test_lease_instance_buyout() {
         grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -781,6 +807,11 @@ fn test_buyout_price_not_reached() {
         grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1003,6 +1034,11 @@ fn test_create_lease_instance_with_security_deposit() {
         grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
     };
 
     // Act

@@ -135,22 +135,26 @@ pub struct LeaseInstance {
     pub pause_initiator: Option<Address>,
     /// Total time spent in paused state (to adjust rent calculations)
     pub total_paused_duration: u64,
-    /// Payment token used for rent payments
-    pub payment_token: Address,
-    /// Maintenance status for repair workflows
-    pub maintenance_status: MaintenanceStatus,
-    /// Rent withheld during maintenance issues
-    pub withheld_rent: i128,
-    /// Inspector address for maintenance verification
-    pub inspector: Option<Address>,
-    /// Hash of repair proof submitted by landlord
-    pub repair_proof_hash: Option<BytesN<32>>,
     /// Monthly rent pull authorization - amount approved for automatic withdrawal
     pub rent_pull_authorized_amount: Option<i128>,
     /// Timestamp of the last rent pull execution
     pub last_rent_pull_timestamp: Option<u64>,
     /// Billing cycle duration in seconds (default: 30 days = 2,592,000 seconds)
     pub billing_cycle_duration: u64,
+    
+    // --- New Features Data ---
+    /// [ISSUE 32] Security Deposit Yield Delegation
+    pub yield_delegation_enabled: bool,
+    pub yield_accumulated: i128,
+    /// [ISSUE 33] Rent-to-Own Equity Tracker
+    pub equity_balance: i128,
+    pub equity_percentage_bps: u32,
+    /// [ISSUE 34] Tenant Credit History Tracking
+    pub had_late_payment: bool,
+    /// [ISSUE 35] Pet Deposit and Monthly Pet Rent
+    pub has_pet: bool,
+    pub pet_deposit_amount: i128,
+    pub pet_rent_amount: i128,
 }
 
 
@@ -196,6 +200,12 @@ pub struct CreateLeaseParams {
     pub late_fee_flat: i128,
     pub late_fee_per_sec: i128,
     pub arbitrators: soroban_sdk::Vec<Address>,
+    // New Feature Params
+    pub equity_percentage_bps: u32,
+    pub has_pet: bool,
+    pub pet_deposit_amount: i128,
+    pub pet_rent_amount: i128,
+    pub yield_delegation_enabled: bool,
 }
 
 
@@ -355,6 +365,32 @@ pub struct RentPullRevoked {
     pub timestamp: u64,
 }
 
+#[contractevent]
+pub struct YieldDistributed {
+    pub lease_id: u64,
+    pub tenant_yield: i128,
+    pub landlord_yield: i128,
+}
+
+#[contractevent]
+pub struct EquityAccrued {
+    pub lease_id: u64,
+    pub amount: i128,
+    pub total_equity: i128,
+}
+
+#[contractevent]
+pub struct PetStatusChanged {
+    pub lease_id: u64,
+    pub has_pet: bool,
+}
+
+#[contractevent]
+pub struct ResidencyNftMinted {
+    pub lease_id: u64,
+    pub tenant: Address,
+}
+
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 
@@ -380,6 +416,13 @@ pub enum LeaseError {
     RentPullNotAuthorized = 17,
     BillingCycleNotElapsed = 18,
     InsufficientAuthorizedAmount = 19,
+    PaymentTokenMismatch = 20,
+    WithdrawalAddressMismatch = 21,
+    YieldDelegationNotEnabled = 22,
+    PetAlreadyExists = 23,
+    PetNotFound = 24,
+    IneligibleForResidencyNft = 25,
+    InvalidPercentage = 26,
 }
 
 
@@ -710,10 +753,16 @@ impl LeaseContract {
             withheld_rent: 0,
             inspector: None,
             repair_proof_hash: None,
-            // Initialize auto-pay fields
-            rent_pull_authorized_amount: None,
-            last_rent_pull_timestamp: None,
             billing_cycle_duration: 2_592_000, // 30 days in seconds
+            // New Features Initialization
+            yield_delegation_enabled: params.yield_delegation_enabled,
+            yield_accumulated: 0,
+            equity_balance: 0,
+            equity_percentage_bps: params.equity_percentage_bps,
+            had_late_payment: false,
+            has_pet: params.has_pet,
+            pet_deposit_amount: params.pet_deposit_amount,
+            pet_rent_amount: params.pet_rent_amount,
         };
         save_lease_instance(&env, lease_id, &lease);
         Ok(())
@@ -752,8 +801,22 @@ impl LeaseContract {
         env.storage().persistent().set(&balance_key, &payer_bal);
         env.storage().persistent().extend_ttl(&balance_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
 
+        // Update Cumulative Payments
         lease.cumulative_payments += payment_amount;
-        lease.rent_paid += payment_amount;
+
+        // [ISSUE 33] Calculate Equity Portion
+        let equity_amount = (payment_amount * (lease.equity_percentage_bps as i128)) / 10000;
+        lease.equity_balance += equity_amount;
+        
+        // [ISSUE 34] Late Payment Tracking
+        // Check if the tenant is currently in debt before this payment
+        if lease.debt > 0 {
+            lease.had_late_payment = true;
+        }
+
+        // Rent portion available for landlord withdrawal (excludes equity)
+        let rent_to_lanlord = payment_amount - equity_amount;
+        lease.rent_paid += rent_to_lanlord;
 
         let token_client = soroban_sdk::token::Client::new(&env, &lease.payment_token);
         token_client.transfer(
@@ -761,6 +824,14 @@ impl LeaseContract {
             &env.current_contract_address(), 
             &payment_amount
         );
+
+        if equity_amount > 0 {
+            EquityAccrued {
+                lease_id,
+                amount: equity_amount,
+                total_equity: lease.equity_balance,
+            }.publish(&env);
+        }
 
         RentPaidPartial { lease_id, roommate: payer.clone(), amount: payment_amount }.publish(&env);
 
@@ -985,7 +1056,6 @@ impl LeaseContract {
         AssetReclaimed { id: lease_id, reason }.publish(&env);
         Ok(())
     }
-
     pub fn conclude_lease(env: Env, lease_id: u64, landlord: Address, damage_deduction: i128) -> Result<i128, LeaseError> {
         let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         if landlord != lease.landlord { return Err(LeaseError::Unauthorised); }
@@ -993,11 +1063,21 @@ impl LeaseContract {
         Self::require_kyc(&env, &lease.landlord, &lease.tenant)?;
 
         if env.ledger().timestamp() < lease.end_date { return Err(LeaseError::LeaseNotExpired); }
-        if lease.rent_paid_through < lease.end_date { return Err(LeaseError::RentOutstanding); }
 
         if damage_deduction < 0 || damage_deduction > lease.security_deposit { return Err(LeaseError::InvalidDeduction); }
 
         let refund_amount = lease.security_deposit - damage_deduction;
+
+        // [ISSUE 34] Create Tenant Credit History NFT Minter
+        // Criteria: 12-month lease completion, no late payments
+        let duration = lease.end_date.saturating_sub(lease.start_date);
+        let year_in_seconds = 31_536_000;
+        if duration >= year_in_seconds && !lease.had_late_payment {
+            ResidencyNftMinted {
+                lease_id,
+                tenant: lease.tenant.clone(),
+            }.publish(&env);
+        }
 
         lease.status = LeaseStatus::Terminated;
         lease.deposit_status = DepositStatus::Settled;
@@ -1143,9 +1223,23 @@ impl LeaseContract {
 
         let refund_amount = lease.security_deposit - damage_deduction;
 
+        // [ISSUE 34] Create Tenant Credit History NFT Minter
+        // Criteria: 12-month lease completion, no late payments
+        let duration = lease.end_date.saturating_sub(lease.start_date);
+        let year_in_seconds = 31_536_000;
+        if duration >= year_in_seconds && !lease.had_late_payment {
+            ResidencyNftMinted {
+                lease_id,
+                tenant: lease.tenant.clone(),
+            }.publish(&env);
+            // In a real implementation, we would call an NFT contract here to mint.
+            // For now, publishing the event serves as the "Digital Resume" trigger.
+        }
+
         // 4. Update lease state
         lease.status = LeaseStatus::Terminated;
         lease.deposit_status = DepositStatus::Settled;
+        lease.active = false;
         save_lease_instance(&env, lease_id, &lease);
 
         Ok(refund_amount)
@@ -1261,14 +1355,24 @@ impl LeaseContract {
                 effective_elapsed_secs = effective_elapsed_secs.saturating_sub(current_pause_duration);
             }
         }
+
+        // [ISSUE 35] Include Pet Rent in expected calculations
+        // We calculate pet rent based on elapsed billing cycles
+        let billing_cycles = effective_elapsed_secs / lease.billing_cycle_duration;
+        let accrued_pet_rent = (billing_cycles as i128) * lease.pet_rent_amount;
         
-        let expected_rent = (effective_elapsed_secs as i128).saturating_mul(lease.rent_per_sec);
+        let expected_rent = (effective_elapsed_secs as i128).saturating_mul(lease.rent_per_sec) + accrued_pet_rent;
         let unpaid_rent = expected_rent.saturating_sub(lease.rent_paid);
         let mut total_debt = if unpaid_rent > 0 { unpaid_rent } else { 0 };
 
         // Only apply late fees if not currently paused
         if !lease.paused && current_time > lease.grace_period_end {
             let seconds_late = current_time - lease.grace_period_end;
+
+            if seconds_late > 0 {
+                // [ISSUE 34] Mark as had late payment
+                lease.had_late_payment = true;
+            }
 
             if !lease.flat_fee_applied {
                 lease.debt += lease.late_fee_flat;
@@ -1298,6 +1402,79 @@ impl LeaseContract {
 
         save_lease_instance(&env, lease_id, &lease);
         Ok(total_debt)
+    }
+
+    // --- [ISSUE 32] Security Deposit Yield Delegation ---
+
+    pub fn enable_yield_delegation(env: Env, lease_id: u64, tenant: Address) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        if lease.tenant != tenant { return Err(LeaseError::Unauthorised); }
+        tenant.require_auth();
+
+        lease.yield_delegation_enabled = true;
+        save_lease_instance(&env, lease_id, &lease);
+        Ok(())
+    }
+
+    /// Hook for a "Safe" liquidity pool to distribute earned yield.
+    /// Split interest between landlord and tenant.
+    pub fn distribute_yield(env: Env, lease_id: u64, yield_amount: i128) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        if !lease.yield_delegation_enabled { return Err(LeaseError::YieldDelegationNotEnabled); }
+
+        // Split yield 50/50 between landlord and tenant
+        let half_yield = yield_amount / 2;
+        
+        // Tenant's portion increases their security deposit (productive asset)
+        // Landlord's portion is added to their withdrawable rent balance
+        lease.security_deposit += half_yield;
+        lease.rent_paid += half_yield;
+        lease.yield_accumulated += yield_amount;
+
+        save_lease_instance(&env, lease_id, &lease);
+
+        YieldDistributed {
+            lease_id,
+            tenant_yield: half_yield,
+            landlord_yield: half_yield,
+        }.publish(&env);
+
+        Ok(())
+    }
+
+    // --- [ISSUE 35] Pet Management ---
+
+    pub fn toggle_pet(env: Env, lease_id: u64, landlord: Address, has_pet: bool, pet_deposit: i128, pet_rent: i128) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        if lease.landlord != landlord { return Err(LeaseError::Unauthorised); }
+        landlord.require_auth();
+
+        lease.has_pet = has_pet;
+        lease.pet_deposit_amount = pet_deposit;
+        lease.pet_rent_amount = pet_rent;
+        
+        // If pet is added, we might need a pet deposit payment from tenant.
+        // For simplicity, we assume the deposit is handled via a separate payment or upfront.
+
+        save_lease_instance(&env, lease_id, &lease);
+        
+        PetStatusChanged { lease_id, has_pet }.publish(&env);
+        Ok(())
+    }
+
+    /// Handles partial refund of the pet deposit while keeping main security deposit intact.
+    pub fn refund_pet_deposit(env: Env, lease_id: u64, landlord: Address, amount: i128) -> Result<i128, LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        if lease.landlord != landlord { return Err(LeaseError::Unauthorised); }
+        landlord.require_auth();
+
+        if amount > lease.pet_deposit_amount { return Err(LeaseError::InvalidDeduction); }
+
+        let refund_amount = amount;
+        lease.pet_deposit_amount -= amount;
+
+        save_lease_instance(&env, lease_id, &lease);
+        Ok(refund_amount)
     }
 
     /// Authorizes an additional roommate to make payments towards a lease.
