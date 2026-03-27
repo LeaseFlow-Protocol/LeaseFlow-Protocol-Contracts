@@ -76,10 +76,24 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         withdrawal_address: None,
         rent_withdrawn: 0,
         arbitrators: soroban_sdk::Vec::new(env),
-        maintenance_status: MaintenanceStatus::None,
-        withheld_rent: 0,
-        repair_proof_hash: None,
-        inspector: None,
+        // Emergency pause fields
+        paused: false,
+        pause_reason: None,
+        paused_at: None,
+        pause_initiator: None,
+        total_paused_duration: 0,
+        rent_pull_authorized_amount: None,
+        last_rent_pull_timestamp: None,
+        billing_cycle_duration: 2_592_000,
+        // New Features
+        yield_delegation_enabled: false,
+        yield_accumulated: 0,
+        equity_balance: 0,
+        equity_percentage_bps: 0,
+        had_late_payment: false,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
     }
 }
 
@@ -449,6 +463,16 @@ fn test_maintenance_flow_with_events() {
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
         payment_token: token.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -457,8 +481,75 @@ fn test_maintenance_flow_with_events() {
 
     client.pay_lease_instance_rent(&LEASE_ID, &tenant, &1000);
 
-    let lease = client.get_lease_instance(&LEASE_ID);
-    assert_eq!(lease.rent_paid, 1000);
+    let params_1 = CreateLeaseParams {
+        tenant: tenant_1,
+        rent_amount: 1000,
+        deposit_amount: 0,
+        security_deposit: 0,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token_contract_id.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
+    };
+
+    let params_2 = CreateLeaseParams {
+        tenant: tenant_2,
+        rent_amount: 1000,
+        deposit_amount: 0,
+        security_deposit: 0,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: token_contract_id.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
+    };
+
+    client.create_lease_instance(&lease_id_1, &landlord, &params_1);
+    client.create_lease_instance(&lease_id_2, &landlord, &params_2);
+    client.set_withdrawal_address(&lease_id_1, &withdrawal);
+    client.set_withdrawal_address(&lease_id_2, &withdrawal);
+
+    // Record rent owed.
+    client.pay_lease_instance_rent(&lease_id_1, &100i128);
+    client.pay_lease_instance_rent(&lease_id_2, &200i128);
+
+    // Fund the lease contract with enough tokens to pay out.
+    let token_client = TokenMockClient::new(&env, &token_contract_id);
+    token_client.mint(&lease_contract_id, &300i128);
+
+    let mut lease_ids = soroban_sdk::Vec::new(&env);
+    lease_ids.push_back(lease_id_1);
+    lease_ids.push_back(lease_id_2);
+
+    let withdrawn = client.batch_withdraw_rent(&landlord, &lease_ids, &token_contract_id);
+    assert_eq!(withdrawn, 300i128);
+
+    assert_eq!(token_client.balance(&withdrawal), 300i128);
+    assert_eq!(token_client.balance(&lease_contract_id), 0i128);
+
+    let lease_1 = client.get_lease_instance(&lease_id_1);
+    let lease_2 = client.get_lease_instance(&lease_id_2);
+    assert_eq!(lease_1.rent_withdrawn, 100i128);
+    assert_eq!(lease_2.rent_withdrawn, 200i128);
 }
 
 #[test]
@@ -478,6 +569,16 @@ fn test_lease_instance_buyout() {
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
         payment_token: token.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -518,6 +619,16 @@ fn test_buyout_price_not_reached() {
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
         payment_token: token.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -644,6 +755,16 @@ fn test_create_lease_instance_with_security_deposit() {
         end_date: END,
         property_uri: String::from_str(&env, "ipfs://test"),
         payment_token: token.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
