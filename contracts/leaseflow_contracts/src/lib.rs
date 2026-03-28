@@ -185,7 +185,6 @@ pub struct HistoricalLease {
     pub terminated_at: u64,
 }
 
-
 #[contractevent]
 pub struct RoommateAdded {
     pub lease_id: u64,
@@ -263,7 +262,6 @@ pub struct EvictionEligible {
     pub debt: i128,
 }
 
-
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
@@ -283,7 +281,6 @@ pub enum LeaseError {
     NotAnArbitrator = 14,
     LeaseAlreadyExists = 15,
 }
-
 
 macro_rules! require {
     ($condition:expr, $error_msg:expr) => {
@@ -390,7 +387,6 @@ mod kyc_contract {
     }
 }
 
-
 #[contract]
 pub struct LeaseContract;
 
@@ -454,7 +450,6 @@ impl LeaseContract {
             .set(&DataKey::KycProvider, &provider);
         Ok(())
     }
-
 
     pub fn initialize_lease(
         env: Env,
@@ -772,7 +767,6 @@ impl LeaseContract {
         None
     }
 
-
     pub fn create_lease_instance(
         env: Env,
         lease_id: u64,
@@ -880,7 +874,6 @@ impl LeaseContract {
         lease.cumulative_payments += payment_amount;
         lease.rent_paid += payment_amount;
 
-
         RentPaidPartial {
             lease_id,
             roommate: payer.clone(),
@@ -942,7 +935,6 @@ impl LeaseContract {
             .clone()
             .ok_or(LeaseError::WithdrawalAddressNotSet)?;
         let _withdrawable_amount = lease.rent_paid - lease.rent_withdrawn;
-
 
         lease.rent_withdrawn += _withdrawable_amount;
         save_lease_instance(&env, lease_id, &lease);
