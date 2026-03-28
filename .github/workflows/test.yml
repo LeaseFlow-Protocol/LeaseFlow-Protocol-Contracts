@@ -1,3 +1,41 @@
+# name: Lease Contract Tests
+
+# on:
+#   push:
+#     branches: [ "main" ]
+#   pull_request:
+#     branches: [ "main" ]
+
+# env:
+#   CARGO_TERM_COLOR: always
+
+# jobs:
+#   test:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+      
+#       - name: Install Rust
+#         uses: dtolnay/rust-toolchain@stable
+#         with:
+#           targets: wasm32-unknown-unknown
+#           components: rustfmt, clippy
+
+#       - name: Rust Cache
+#         uses: Swatinem/rust-cache@v2
+
+#       - name: Check Formatting
+#         run: cargo fmt --check
+
+#       - name: Clippy
+#         run: cargo clippy --all-targets --all-features -- -D warnings
+
+#       - name: Build Contract
+#         run: cargo build --target wasm32-unknown-unknown --release
+
+#       - name: Run Unit Tests
+#         run: cargo test
+
 name: Lease Contract Tests
 
 on:
@@ -28,10 +66,13 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        # Exclude the fuzz crate so we don't try to run Wasm checks on C++ code
+        run: cargo clippy --workspace --exclude leaseflow-fuzz --all-targets --all-features -- -D warnings
 
       - name: Build Contract
-        run: cargo build --target wasm32-unknown-unknown --release
+        # Exclude the fuzz crate from the WebAssembly build target
+        run: cargo build --workspace --exclude leaseflow-fuzz --target wasm32-unknown-unknown --release
 
       - name: Run Unit Tests
-        run: cargo test
+        # Run standard Rust tests (fuzzing usually runs on a separate dedicated workflow)
+        run: cargo test --workspace --exclude leaseflow-fuzz
