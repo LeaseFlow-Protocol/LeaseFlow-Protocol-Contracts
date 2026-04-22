@@ -32,6 +32,40 @@ impl KycMock {
     }
 }
 
+#[contract]
+pub struct DexMock;
+
+#[contractimpl]
+impl DexMock {
+    pub fn path_payment(
+        env: Env,
+        from: Address,
+        to: Address,
+        amount_in: i128,
+        max_slippage_bps: u32,
+        path: soroban_sdk::Vec<Address>,
+    ) -> Result<i128, i32> {
+        let available = env
+            .storage()
+            .instance()
+            .get::<_, i128>(&symbol_short!("liq"))
+            .unwrap_or(0);
+        if available < amount_in || path.is_empty() {
+            return Err(1);
+        }
+        let output = amount_in.saturating_mul(9_900) / 10_000;
+        let min_out = amount_in.saturating_mul(10_000i128 - max_slippage_bps as i128) / 10_000i128;
+        if output < min_out {
+            return Err(2);
+        }
+        let _ = (from, to);
+        Ok(output)
+    }
+    pub fn set_liquidity(env: Env, amount: i128) {
+        env.storage().instance().set(&symbol_short!("liq"), &amount);
+    }
+}
+
 fn make_env() -> Env {
     let env = Env::default();
     env.ledger().with_mut(|l| l.timestamp = START);
@@ -468,6 +502,10 @@ fn test_maintenance_flow_with_events() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -495,6 +533,10 @@ fn test_maintenance_flow_with_events() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     let params_2 = CreateLeaseParams {
@@ -516,6 +558,10 @@ fn test_maintenance_flow_with_events() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&lease_id_1, &landlord, &params_1);
@@ -572,6 +618,10 @@ fn test_lease_instance_buyout() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -622,6 +672,10 @@ fn test_buyout_price_not_reached() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -754,6 +808,10 @@ fn test_create_lease_instance_with_security_deposit() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -763,6 +821,89 @@ fn test_create_lease_instance_with_security_deposit() {
     assert_eq!(lease.tenant, tenant);
     assert_eq!(lease.security_deposit, 500);
     assert_eq!(lease.status, LeaseStatus::Pending);
+}
+
+#[test]
+fn test_cross_asset_deposit_locks_with_swap() {
+    let env = make_env();
+    let (id, client) = setup(&env);
+    let dex_id = env.register(DexMock, ());
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let usdc = Address::generate(&env);
+    let xlm = Address::generate(&env);
+
+    DexMockClient::new(&env, &dex_id).set_liquidity(&5_000);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 2000,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: usdc.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
+        deposit_asset: Some(xlm.clone()),
+        dex_contract: Some(dex_id.clone()),
+        max_slippage_bps: 100,
+        swap_path: soroban_sdk::Vec::from_array(&env, [xlm.clone(), usdc.clone()]),
+    };
+
+    client.create_lease_instance(&LEASE_ID, &landlord, &params);
+    let lease = read_lease(&env, &id, LEASE_ID).unwrap();
+    assert_eq!(lease.security_deposit, 495);
+}
+
+#[test]
+fn test_cross_asset_deposit_reverts_on_high_slippage_or_no_liquidity() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let dex_id = env.register(DexMock, ());
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let usdc = Address::generate(&env);
+    let xlm = Address::generate(&env);
+
+    DexMockClient::new(&env, &dex_id).set_liquidity(&100);
+
+    let params = CreateLeaseParams {
+        tenant: tenant.clone(),
+        rent_amount: 1000,
+        deposit_amount: 2000,
+        security_deposit: 500,
+        start_date: START,
+        end_date: END,
+        property_uri: String::from_str(&env, "ipfs://test"),
+        payment_token: usdc.clone(),
+        arbitrators: soroban_sdk::Vec::new(&env),
+        rent_per_sec: 1,
+        grace_period_end: END,
+        late_fee_flat: 0,
+        late_fee_per_sec: 0,
+        equity_percentage_bps: 0,
+        has_pet: false,
+        pet_deposit_amount: 0,
+        pet_rent_amount: 0,
+        yield_delegation_enabled: false,
+        deposit_asset: Some(xlm.clone()),
+        dex_contract: Some(dex_id.clone()),
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::from_array(&env, [xlm.clone(), usdc.clone()]),
+    };
+
+    let result = client.try_create_lease_instance(&LEASE_ID, &landlord, &params);
+    assert!(result.is_err());
 }
 
 #[test]
@@ -835,6 +976,10 @@ fn test_double_sign_prevention() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     let result = client.try_create_lease_instance(&lease_id, &landlord, &params);
@@ -887,6 +1032,10 @@ fn test_utility_billing_request_success() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -936,6 +1085,10 @@ fn test_utility_billing_unauthorized_landlord() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -975,6 +1128,10 @@ fn test_utility_billing_invalid_amount() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1014,6 +1171,10 @@ fn test_utility_bill_payment_success() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1060,6 +1221,10 @@ fn test_utility_bill_payment_expired() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1104,6 +1269,10 @@ fn test_utility_bill_wrong_payment_amount() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1150,6 +1319,10 @@ fn test_sublet_authorization_success() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1214,6 +1387,10 @@ fn test_sublet_invalid_percentage_split() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1265,6 +1442,10 @@ fn test_sublet_invalid_dates() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1317,6 +1498,10 @@ fn test_sublet_rent_payment_success() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1381,6 +1566,10 @@ fn test_sublet_termination_success() {
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
         yield_delegation_enabled: false,
+        deposit_asset: None,
+        dex_contract: None,
+        max_slippage_bps: 0,
+        swap_path: soroban_sdk::Vec::new(&env),
     };
 
     client.create_lease_instance(&LEASE_ID, &landlord, &params);
@@ -1695,3 +1884,5 @@ fn test_terminate_lease_no_bounty_without_platform_fee() {
     client.terminate_lease(&LEASE_ID, &landlord);
     assert!(read_lease(&env, &contract_id, LEASE_ID).is_none());
 }
+
+
