@@ -46,6 +46,28 @@ pub enum MaintenanceStatus {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DamageSeverity {
+    NormalWearAndTear = 0,
+    Minor = 1,
+    Moderate = 2,
+    Major = 3,
+    Severe = 4,
+    Catastrophic = 5,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OraclePayload {
+    pub lease_id: u64,
+    pub oracle_pubkey: BytesN<32>,
+    pub damage_severity: DamageSeverity,
+    pub nonce: u64,
+    pub timestamp: u64,
+    pub signature: BytesN<64>,
+}
+
+#[contracttype]
 pub enum DepositRelease {
     FullRefund,
     PartialRefund(DepositReleasePartial),
@@ -193,7 +215,6 @@ pub struct CreateLeaseParams {
 }
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Lease(Symbol),
     LeaseInstance(u64),
@@ -209,6 +230,9 @@ pub enum DataKey {
     PlatformFeeToken,
     PlatformFeeRecipient,
     TermsHash,
+    WhitelistedOracle(BytesN<32>),
+    OracleNonce(BytesN<32>, u64),
+    TenantFlag(u64),
 }
 
 #[contracttype]
@@ -346,6 +370,23 @@ pub struct MutualLeaseFinalized {
     pub landlord_payout: i128,
 }
 
+#[contractevent]
+pub struct DepositSlashed {
+    pub lease_id: u64,
+    pub oracle_pubkey: BytesN<32>,
+    pub damage_code: u32,
+    pub deducted_amount: i128,
+    pub tenant_refund: i128,
+    pub landlord_payout: i128,
+}
+
+#[contractevent]
+pub struct TenantFlagged {
+    pub lease_id: u64,
+    pub tenant: Address,
+    pub reason: String,
+}
+
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
@@ -368,6 +409,11 @@ pub enum LeaseError {
     PathPaymentFailed = 17,
     SlippageExceeded = 18,
     InvalidReleaseMath = 19,
+    OracleNotWhitelisted = 20,
+    InvalidSignature = 21,
+    InvalidNonce = 22,
+    LeaseNotTerminated = 23,
+    DepositAlreadySettled = 24,
 }
 
 macro_rules! require {
@@ -1716,6 +1762,219 @@ impl LeaseContract {
         }
 
         env.deployer().update_current_contract_wasm(new_wasm_hash);
+        Ok(())
+    }
+
+    pub fn whitelist_oracle(
+        env: Env,
+        admin: Address,
+        oracle_pubkey: BytesN<32>,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::WhitelistedOracle(oracle_pubkey), &true);
+        Ok(())
+    }
+
+    pub fn remove_oracle(
+        env: Env,
+        admin: Address,
+        oracle_pubkey: BytesN<32>,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        
+        env.storage()
+            .instance()
+            .remove(&DataKey::WhitelistedOracle(oracle_pubkey));
+        Ok(())
+    }
+
+    fn is_oracle_whitelisted(env: &Env, oracle_pubkey: &BytesN<32>) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::WhitelistedOracle(oracle_pubkey.clone()))
+    }
+
+    fn verify_ed25519_signature(
+        env: &Env,
+        pubkey: &BytesN<32>,
+        message: &soroban_sdk::Bytes,
+        signature: &BytesN<64>,
+    ) -> bool {
+        env.crypto().ed25519_verify(pubkey, message, signature)
+    }
+
+    fn calculate_penalty_percentage(severity: DamageSeverity) -> u32 {
+        match severity {
+            DamageSeverity::NormalWearAndTear => 0,
+            DamageSeverity::Minor => 10,
+            DamageSeverity::Moderate => 25,
+            DamageSeverity::Major => 50,
+            DamageSeverity::Severe => 75,
+            DamageSeverity::Catastrophic => 100,
+        }
+    }
+
+    fn get_oracle_nonce(env: &Env, oracle_pubkey: &BytesN<32>) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OracleNonce(oracle_pubkey.clone(), 0))
+            .unwrap_or(0)
+    }
+
+    fn set_oracle_nonce(env: &Env, oracle_pubkey: &BytesN<32>, nonce: u64) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::OracleNonce(oracle_pubkey.clone(), 0), &nonce);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::OracleNonce(oracle_pubkey.clone(), 0), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+    }
+
+    fn is_tenant_flagged(env: &Env, lease_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::TenantFlag(lease_id))
+    }
+
+    fn flag_tenant(env: &Env, lease_id: u64, tenant: Address, reason: String) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::TenantFlag(lease_id), &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TenantFlag(lease_id), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        
+        TenantFlagged {
+            lease_id,
+            tenant,
+            reason,
+        }
+        .publish(env);
+    }
+
+    pub fn execute_deposit_slash(
+        env: Env,
+        payload: OraclePayload,
+    ) -> Result<(), LeaseError> {
+        let current_time = env.ledger().timestamp();
+        
+        if !Self::is_oracle_whitelisted(&env, &payload.oracle_pubkey) {
+            return Err(LeaseError::OracleNotWhitelisted);
+        }
+
+        let stored_nonce = Self::get_oracle_nonce(&env, &payload.oracle_pubkey);
+        if payload.nonce <= stored_nonce {
+            return Err(LeaseError::InvalidNonce);
+        }
+
+        if payload.timestamp > current_time || current_time - payload.timestamp > 86400 {
+            return Err(LeaseError::InvalidSignature);
+        }
+
+        let mut message_data = soroban_sdk::Bytes::new(&env);
+        message_data.append(&payload.lease_id.to_val());
+        message_data.append(&payload.oracle_pubkey.to_val());
+        message_data.append(&(payload.damage_severity as u32).to_val());
+        message_data.append(&payload.nonce.to_val());
+        message_data.append(&payload.timestamp.to_val());
+
+        if !Self::verify_ed25519_signature(&env, &payload.oracle_pubkey, &message_data, &payload.signature) {
+            return Err(LeaseError::InvalidSignature);
+        }
+
+        Self::set_oracle_nonce(&env, &payload.oracle_pubkey, payload.nonce);
+
+        let mut lease = load_lease_instance_by_id(&env, payload.lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+
+        if lease.status != LeaseStatus::Terminated && lease.status != LeaseStatus::Expired {
+            return Err(LeaseError::LeaseNotTerminated);
+        }
+
+        if lease.deposit_status == DepositStatus::Settled {
+            return Err(LeaseError::DepositAlreadySettled);
+        }
+
+        let total_deposit = lease.security_deposit + lease.deposit_amount;
+        let penalty_percentage = Self::calculate_penalty_percentage(payload.damage_severity);
+        let penalty_amount = if penalty_percentage == 0 {
+            0
+        } else {
+            total_deposit.saturating_mul(penalty_percentage as i128) / 100
+        };
+
+        let tenant_refund = total_deposit.saturating_sub(penalty_amount);
+        let landlord_payout = penalty_amount;
+
+        if payload.damage_severity as u32 >= DamageSeverity::Severe as u32 && penalty_amount >= total_deposit {
+            Self::flag_tenant(&env, payload.lease_id, lease.tenant.clone(), 
+                String::from_str(&env, "Severe damage exceeding deposit value"));
+        }
+
+        if tenant_refund > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.tenant,
+                &tenant_refund,
+            );
+        }
+
+        if landlord_payout > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.landlord,
+                &landlord_payout,
+            );
+        }
+
+        lease.deposit_status = DepositStatus::Settled;
+        lease.active = false;
+        save_lease_instance(&env, payload.lease_id, &lease);
+
+        if let (Some(nft_contract_addr), Some(token_id)) =
+            (lease.nft_contract.clone(), lease.token_id)
+        {
+            delete_usage_rights(&env, nft_contract_addr.clone(), token_id);
+            let nft_client = nft_contract::NftClient::new(&env, &nft_contract_addr);
+            nft_client.transfer_from(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &lease.landlord,
+                &token_id,
+            );
+        }
+
+        DepositSlashed {
+            lease_id: payload.lease_id,
+            oracle_pubkey: payload.oracle_pubkey.clone(),
+            damage_code: payload.damage_severity as u32,
+            deducted_amount: penalty_amount,
+            tenant_refund,
+            landlord_payout,
+        }
+        .publish(&env);
+
         Ok(())
     }
 }

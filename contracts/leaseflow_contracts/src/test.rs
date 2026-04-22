@@ -8,6 +8,7 @@ use super::*;
 use crate::{
     CreateLeaseParams, DataKey, DepositStatus, HistoricalLease, LeaseContract, LeaseContractClient,
     LeaseStatus, MaintenanceStatus, RateType, SubletStatus, UtilityBillStatus,
+    DamageSeverity, OraclePayload,
 };
 use soroban_sdk::{
     contract, contractclient, contractimpl, symbol_short,
@@ -136,6 +137,292 @@ fn seed_lease(env: &Env, contract_id: &Address, lease_id: u64, lease: &LeaseInst
 
 fn read_lease(env: &Env, contract_id: &Address, lease_id: u64) -> Option<LeaseInstance> {
     env.as_contract(contract_id, || load_lease_instance_by_id(env, lease_id))
+}
+
+#[test]
+fn test_oracle_whitelist_management() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[1; 32]);
+    let unauthorized_user = Address::generate(&env);
+
+    client.set_admin(&admin);
+
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+    
+    let is_whitelisted = env.as_contract(contract_id, || {
+        crate::LeaseContract::is_oracle_whitelisted(&env, &oracle_pubkey)
+    });
+    assert!(is_whitelisted);
+
+    let result = client.try_whitelist_oracle(&unauthorized_user, &oracle_pubkey);
+    assert_eq!(result, Err(LeaseError::Unauthorised));
+
+    client.remove_oracle(&admin, &oracle_pubkey);
+    
+    let is_whitelisted_after_removal = env.as_contract(contract_id, || {
+        crate::LeaseContract::is_oracle_whitelisted(&env, &oracle_pubkey)
+    });
+    assert!(!is_whitelisted_after_removal);
+}
+
+#[test]
+fn test_oracle_nonce_management() {
+    let env = make_env();
+    let (contract_id, _) = setup(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[2; 32]);
+
+    let initial_nonce = env.as_contract(contract_id, || {
+        crate::LeaseContract::get_oracle_nonce(&env, &oracle_pubkey)
+    });
+    assert_eq!(initial_nonce, 0);
+
+    env.as_contract(contract_id, || {
+        crate::LeaseContract::set_oracle_nonce(&env, &oracle_pubkey, 5);
+    });
+
+    let updated_nonce = env.as_contract(contract_id, || {
+        crate::LeaseContract::get_oracle_nonce(&env, &oracle_pubkey)
+    });
+    assert_eq!(updated_nonce, 5);
+}
+
+#[test]
+fn test_damage_severity_penalty_calculation() {
+    let env = make_env();
+    let (contract_id, _) = setup(&env);
+
+    let test_cases = vec![
+        (DamageSeverity::NormalWearAndTear, 0),
+        (DamageSeverity::Minor, 10),
+        (DamageSeverity::Moderate, 25),
+        (DamageSeverity::Major, 50),
+        (DamageSeverity::Severe, 75),
+        (DamageSeverity::Catastrophic, 100),
+    ];
+
+    for (severity, expected_percentage) in test_cases {
+        let calculated_percentage = env.as_contract(contract_id, || {
+            crate::LeaseContract::calculate_penalty_percentage(severity)
+        });
+        assert_eq!(calculated_percentage, expected_percentage);
+    }
+}
+
+#[test]
+fn test_execute_deposit_slash_normal_wear_and_tear() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[3; 32]);
+    
+    client.set_admin(&admin);
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.status = LeaseStatus::Terminated;
+    lease.payment_token = Address::generate(&env);
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+
+    let payload = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::NormalWearAndTear,
+        nonce: 1,
+        timestamp: env.ledger().timestamp(),
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    env.as_contract(contract_id, || {
+        crate::LeaseContract::set_oracle_nonce(&env, &payload.oracle_pubkey, 0);
+    });
+
+    let result = client.try_execute_deposit_slash(&payload);
+    assert_eq!(result, Err(LeaseError::InvalidSignature));
+}
+
+#[test]
+fn test_execute_deposit_slash_unauthorized_oracle() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let unauthorized_oracle = BytesN::from_array(&env, &[4; 32]);
+    
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.status = LeaseStatus::Terminated;
+    seed_lease(&env, &Address::generate(&env), LEASE_ID, &lease);
+
+    let payload = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey: unauthorized_oracle,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 1,
+        timestamp: env.ledger().timestamp(),
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result = client.try_execute_deposit_slash(&payload);
+    assert_eq!(result, Err(LeaseError::OracleNotWhitelisted));
+}
+
+#[test]
+fn test_execute_deposit_slash_invalid_nonce() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[5; 32]);
+    
+    client.set_admin(&admin);
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.status = LeaseStatus::Terminated;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+
+    env.as_contract(contract_id, || {
+        crate::LeaseContract::set_oracle_nonce(&env, &oracle_pubkey, 5);
+    });
+
+    let payload = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 3,
+        timestamp: env.ledger().timestamp(),
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result = client.try_execute_deposit_slash(&payload);
+    assert_eq!(result, Err(LeaseError::InvalidNonce));
+}
+
+#[test]
+fn test_execute_deposit_slash_lease_not_terminated() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[6; 32]);
+    
+    client.set_admin(&admin);
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+
+    let lease = make_lease(&env, &landlord, &tenant);
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+
+    let payload = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 1,
+        timestamp: env.ledger().timestamp(),
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result = client.try_execute_deposit_slash(&payload);
+    assert_eq!(result, Err(LeaseError::LeaseNotTerminated));
+}
+
+#[test]
+fn test_execute_deposit_slash_deposit_already_settled() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[7; 32]);
+    
+    client.set_admin(&admin);
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.status = LeaseStatus::Terminated;
+    lease.deposit_status = DepositStatus::Settled;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+
+    let payload = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 1,
+        timestamp: env.ledger().timestamp(),
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result = client.try_execute_deposit_slash(&payload);
+    assert_eq!(result, Err(LeaseError::DepositAlreadySettled));
+}
+
+#[test]
+fn test_tenant_flagging_functionality() {
+    let env = make_env();
+    let (contract_id, _) = setup(&env);
+    let tenant = Address::generate(&env);
+    let reason = String::from_str(&env, "Severe damage exceeding deposit value");
+
+    let is_flagged_initially = env.as_contract(contract_id, || {
+        crate::LeaseContract::is_tenant_flagged(&env, LEASE_ID)
+    });
+    assert!(!is_flagged_initially);
+
+    env.as_contract(contract_id, || {
+        crate::LeaseContract::flag_tenant(&env, LEASE_ID, tenant.clone(), reason.clone());
+    });
+
+    let is_flagged_after = env.as_contract(contract_id, || {
+        crate::LeaseContract::is_tenant_flagged(&env, LEASE_ID)
+    });
+    assert!(is_flagged_after);
+}
+
+#[test]
+fn test_signature_timestamp_validation() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let oracle_pubkey = BytesN::from_array(&env, &[8; 32]);
+    
+    client.set_admin(&admin);
+    client.whitelist_oracle(&admin, &oracle_pubkey);
+
+    let mut lease = make_lease(&env, &landlord, &tenant);
+    lease.status = LeaseStatus::Terminated;
+    seed_lease(&env, &contract_id, LEASE_ID, &lease);
+
+    let future_timestamp = env.ledger().timestamp() + 100000;
+    let payload_future = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 1,
+        timestamp: future_timestamp,
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result_future = client.try_execute_deposit_slash(&payload_future);
+    assert_eq!(result_future, Err(LeaseError::InvalidSignature));
+
+    let old_timestamp = env.ledger().timestamp() - 100000;
+    let payload_old = OraclePayload {
+        lease_id: LEASE_ID,
+        oracle_pubkey,
+        damage_severity: DamageSeverity::Minor,
+        nonce: 1,
+        timestamp: old_timestamp,
+        signature: BytesN::from_array(&env, &[0; 64]),
+    };
+
+    let result_old = client.try_execute_deposit_slash(&payload_old);
+    assert_eq!(result_old, Err(LeaseError::InvalidSignature));
 }
 
 #[test]
