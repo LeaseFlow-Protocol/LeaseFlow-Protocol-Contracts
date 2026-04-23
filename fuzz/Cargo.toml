@@ -24,3 +24,9 @@ path = "fuzz_targets/fuzz_deposit_split.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "fuzz_mutual_release"
+path = "fuzz_targets/fuzz_mutual_release.rs"
+test = false
+doc = false
+
