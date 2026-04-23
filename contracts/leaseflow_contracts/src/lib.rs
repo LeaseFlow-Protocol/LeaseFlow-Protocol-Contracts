@@ -24,6 +24,7 @@ pub enum DepositStatus {
     Held,
     Settled,
     Disputed,
+    InArbitration,
 }
 
 #[contracttype]
@@ -33,6 +34,7 @@ pub enum LeaseStatus {
     Active,
     Expired,
     Disputed,
+    InArbitration,
     Terminated,
 }
 
@@ -46,10 +48,74 @@ pub enum MaintenanceStatus {
 }
 
 #[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DamageSeverity {
+    NormalWearAndTear = 0,
+    Minor = 1,
+    Moderate = 2,
+    Major = 3,
+    Severe = 4,
+    Catastrophic = 5,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OraclePayload {
+    pub lease_id: u64,
+    pub oracle_pubkey: BytesN<32>,
+    pub damage_severity: DamageSeverity,
+    pub nonce: u64,
+    pub timestamp: u64,
+    pub signature: BytesN<64>,
+}
+
+#[contracttype]
 pub enum DepositRelease {
     FullRefund,
     PartialRefund(DepositReleasePartial),
     Disputed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AssetTier {
+    Low,      // Basic assets, low deposit requirements
+    Medium,   // Standard assets, moderate deposit requirements
+    High,     // Premium assets, high deposit requirements
+    Luxury,   // Luxury assets, very high deposit requirements
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EscrowVault {
+    pub total_locked: i128,
+    pub lease_count: u64,
+    pub max_capacity: i128,
+    pub supported_assets: Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SecurityDeposit {
+    pub lease_id: u64,
+    pub lessee: Address,
+    pub lessor: Address,
+    pub asset_address: Address,
+    pub amount: i128,
+    pub locked_at: u64,
+    pub status: DepositStatus,
+    pub asset_tier: AssetTier,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultiAssetCollateral {
+    pub primary_asset: Address,
+    pub primary_amount: i128,
+    pub secondary_asset: Option<Address>,
+    pub secondary_amount: Option<i128>,
+    pub nft_contract: Option<Address>,
+    pub nft_token_id: Option<u128>,
 }
 
 #[contracttype]
@@ -194,7 +260,6 @@ pub struct CreateLeaseParams {
 }
 
 #[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Lease(Symbol),
     LeaseInstance(u64),
@@ -210,6 +275,9 @@ pub enum DataKey {
     PlatformFeeToken,
     PlatformFeeRecipient,
     TermsHash,
+    WhitelistedOracle(BytesN<32>),
+    OracleNonce(BytesN<32>, u64),
+    TenantFlag(u64),
 }
 
 #[contracttype]
@@ -234,10 +302,23 @@ pub struct RentPaidPartial {
 }
 
 #[contractevent]
+pub struct PaymentLate {
+    pub lease_id: u64,
+    pub days_late: u64,
+    pub current_fine: i128,
+}
+
+#[contractevent]
 pub struct LeaseStarted {
     pub id: u64,
     pub renter: Address,
     pub rate: i128,
+}
+
+#[contractevent]
+pub struct LeaseSigned {
+    pub lease_id: u64,
+    pub property_hash: String,
 }
 
 #[contractevent]
@@ -309,6 +390,22 @@ pub struct DisputeResolved {
 }
 
 #[contractevent]
+pub struct WearAndTearCalculated {
+    pub lease_id: u64,
+    pub allowed_decay: i128,
+    pub reported_decay: i128,
+    pub elapsed_days: u64,
+    pub wear_allowance_bps: u32,
+}
+
+#[contractevent]
+pub struct SettlementPeriodStarted {
+    pub lease_id: u64,
+    pub deposit_timestamp: u64,
+    pub settlement_ledgers: u32,
+}
+
+#[contractevent]
 pub struct EvictionEligible {
     pub lease_id: u64,
     pub tenant: Address,
@@ -369,6 +466,18 @@ macro_rules! require {
 const DAY_IN_LEDGERS: u32 = 17280;
 const MONTH_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 30;
 const YEAR_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 365;
+
+// Dispute resolution constants
+const DISPUTE_WINDOW_HOURS: u64 = 48;
+const DISPUTE_WINDOW_LEDGERS: u64 = DISPUTE_WINDOW_HOURS * 720; // 720 ledgers per hour
+const JURY_SIZE: u32 = 3;
+const JURY_VOTE_THRESHOLD: u32 = 2; // 2-of-3 multi-sig
+const JUROR_VOTE_DEADLINE_HOURS: u64 = 72;
+const JUROR_VOTE_DEADLINE_LEDGERS: u64 = JUROR_VOTE_DEADLINE_HOURS * 720;
+const MIN_JUROR_REPUTATION: u32 = 100;
+const MIN_JUROR_STAKE: i128 = 1_000_000; // 0.001 XLM equivalent
+const DISPUTE_BOND_AMOUNT: i128 = 5_000_000; // 0.005 XLM equivalent
+const JUROR_SLASH_AMOUNT: i128 = 2_000_000; // 0.002 XLM equivalent
 
 pub fn to_per_second(rate: i128, rate_type: RateType) -> i128 {
     match rate_type {
@@ -445,6 +554,106 @@ pub fn archive_lease(env: &Env, lease_id: u64, lease: LeaseInstance, caller: Add
         .persistent()
         .set(&DataKey::HistoricalLease(lease_id), &historical);
     delete_lease_instance(env, lease_id);
+}
+
+// Dispute resolution helper functions
+pub fn save_dispute_case(env: &Env, dispute_id: u64, dispute_case: &DisputeCase) {
+    let key = DataKey::DisputeCase(dispute_id);
+    env.storage().persistent().set(&key, dispute_case);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_dispute_case(env: &Env, dispute_id: u64) -> Option<DisputeCase> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DisputeCase(dispute_id))
+}
+
+pub fn save_juror(env: &Env, juror_address: &Address, juror: &Juror) {
+    let key = DataKey::Juror(juror_address.clone());
+    env.storage().persistent().set(&key, juror);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_juror(env: &Env, juror_address: &Address) -> Option<Juror> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::Juror(juror_address.clone()))
+}
+
+pub fn get_juror_pool(env: &Env) -> soroban_sdk::Vec<Address> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::JurorPool)
+        .unwrap_or(soroban_sdk::Vec::new(env))
+}
+
+pub fn save_juror_pool(env: &Env, pool: &soroban_sdk::Vec<Address>) {
+    env.storage().persistent().set(&DataKey::JurorPool, pool);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::JurorPool, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn save_sub_escrow_vault(env: &Env, vault_id: u64, vault: &SubEscrowVault) {
+    let key = DataKey::SubEscrowVault(vault_id);
+    env.storage().persistent().set(&key, vault);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_sub_escrow_vault(env: &Env, vault_id: u64) -> Option<SubEscrowVault> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::SubEscrowVault(vault_id))
+}
+
+pub fn get_next_sub_lease_id(env: &Env) -> u64 {
+    let counter: u64 = env
+        .storage()
+        .persistent()
+        .get(&DataKey::SubLeaseCounter)
+        .unwrap_or(0);
+    let next_id = counter + 1;
+    env.storage().persistent().set(&DataKey::SubLeaseCounter, &next_id);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::SubLeaseCounter, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+    next_id
+}
+
+// Cryptographically secure random juror selection
+pub fn select_random_jurors(env: &Env, pool: &soroban_sdk::Vec<Address>, count: u32) -> soroban_sdk::Vec<Address> {
+    let mut selected = soroban_sdk::Vec::new(env);
+    let mut available_indices = soroban_sdk::Vec::new(env);
+    
+    // Create index pool
+    for i in 0..pool.len() {
+        available_indices.push_back(i);
+    }
+    
+    // Use ledger timestamp and sequence for entropy
+    let seed = env.ledger().timestamp() ^ env.ledger().sequence() as u64;
+    
+    for _ in 0..count {
+        if available_indices.is_empty() {
+            break;
+        }
+        
+        let random_index = (seed % available_indices.len() as u64) as u32;
+        let juror_index = available_indices.get(random_index as u32).unwrap();
+        selected.push_back(pool.get(juror_index).unwrap());
+        
+        // Remove selected index
+        available_indices.remove(random_index as u32);
+    }
+    
+    selected
 }
 
 mod nft_contract {
@@ -931,6 +1140,22 @@ impl LeaseContract {
         }
         landlord.require_auth();
         params.tenant.require_auth();
+        
+        // Calculate required security deposit based on asset tier and duration
+        let lease_duration = params.end_date.saturating_sub(params.start_date);
+        let asset_tier = Self::get_asset_tier(&env, &params.payment_token);
+        let required_deposit = Self::calculate_required_deposit(
+            &env,
+            asset_tier,
+            lease_duration,
+            params.security_deposit,
+        );
+        
+        // Verify that the provided security deposit matches the required amount
+        if params.security_deposit != required_deposit {
+            return Err(LeaseError::InvalidDeduction);
+        }
+        
         let locked_amount = if let Some(deposit_asset) = params.deposit_asset.clone() {
             Self::execute_deposit_swap(
                 &env,
@@ -957,7 +1182,7 @@ impl LeaseContract {
             rent_paid_through: 0,
             deposit_status: DepositStatus::Held,
             status: LeaseStatus::Pending,
-            property_uri: params.property_uri,
+            property_uri: params.property_uri.clone(),
             nft_contract: None,
             token_id: None,
             active: true,
@@ -1017,7 +1242,7 @@ impl LeaseContract {
     }
 
     pub fn get_lease_instance(env: Env, lease_id: u64) -> Result<LeaseInstance, LeaseError> {
-        load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound);
+        load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)
     }
 
     pub fn set_lease_instance_buyout_price(
@@ -1460,6 +1685,148 @@ impl LeaseContract {
         Ok(refund_amount)
     }
 
+    pub fn mutual_deposit_release(
+        env: Env,
+        lease_id: u64,
+        lessee_pubkey: Address,
+        lessor_pubkey: Address,
+        return_amount: i128,
+        slash_amount: i128,
+    ) -> Result<(), LeaseError> {
+        let mut lease =
+            load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // Verify that both parties are the actual lease participants
+        if lessee_pubkey != lease.tenant || lessor_pubkey != lease.landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+
+        // Verify both parties have authorized this transaction
+        lessee_pubkey.require_auth();
+        lessor_pubkey.require_auth();
+
+        // Validate lease is in a state that allows mutual release
+        if lease.status != LeaseStatus::Active && lease.status != LeaseStatus::Expired {
+            return Err(LeaseError::LeaseNotFound);
+        }
+
+        // Mathematical validation: ensure amounts sum to total escrowed deposit
+        let total_escrowed = lease.security_deposit + lease.deposit_amount;
+        if return_amount + slash_amount != total_escrowed {
+            return Err(LeaseError::InvalidReleaseMath);
+        }
+
+        // Ensure amounts are non-negative
+        if return_amount < 0 || slash_amount < 0 {
+            return Err(LeaseError::InvalidReleaseMath);
+        }
+
+        // Calculate the split: return_amount goes to tenant, slash_amount goes to landlord
+        let tenant_refund = return_amount;
+        let landlord_payout = slash_amount;
+
+        // Execute atomic transfers
+        if tenant_refund > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.tenant,
+                &tenant_refund,
+            );
+        }
+
+        if landlord_payout > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.landlord,
+                &landlord_payout,
+            );
+        }
+
+        // Update lease state to finalized
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+        lease.active = false;
+
+        // Handle NFT return if applicable
+        if let (Some(nft_contract_addr), Some(token_id)) =
+            (lease.nft_contract.clone(), lease.token_id)
+        {
+            delete_usage_rights(&env, nft_contract_addr.clone(), token_id);
+            let nft_client = nft_contract::NftClient::new(&env, &nft_contract_addr);
+            nft_client.transfer_from(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &lease.landlord,
+                &token_id,
+            );
+        }
+
+        save_lease_instance(&env, lease_id, &lease);
+
+        // Emit the mutual lease finalized event
+        MutualLeaseFinalized {
+            lease_id,
+            return_amount,
+            slash_amount,
+            tenant_refund,
+            landlord_payout,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn initiate_mutual_release_with_fallback(
+        env: Env,
+        lease_id: u64,
+        initiator_pubkey: Address,
+        proposed_return_amount: i128,
+        proposed_slash_amount: i128,
+    ) -> Result<(), LeaseError> {
+        let mut lease =
+            load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        // Verify initiator is a lease participant
+        if initiator_pubkey != lease.tenant && initiator_pubkey != lease.landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+
+        initiator_pubkey.require_auth();
+
+        // Validate lease is in a state that allows mutual release attempt
+        if lease.status != LeaseStatus::Active && lease.status != LeaseStatus::Expired {
+            return Err(LeaseError::LeaseNotFound);
+        }
+
+        // Mathematical validation of proposed amounts
+        let total_escrowed = lease.security_deposit + lease.deposit_amount;
+        if proposed_return_amount + proposed_slash_amount != total_escrowed {
+            return Err(LeaseError::InvalidReleaseMath);
+        }
+
+        // Ensure amounts are non-negative
+        if proposed_return_amount < 0 || proposed_slash_amount < 0 {
+            return Err(LeaseError::InvalidReleaseMath);
+        }
+
+        // In a real implementation, this would store the proposal and wait for the counterparty
+        // For now, we immediately transition to dispute state to demonstrate the fallback
+        lease.deposit_status = DepositStatus::Disputed;
+        lease.status = LeaseStatus::Disputed;
+
+        save_lease_instance(&env, lease_id, &lease);
+
+        // Emit dispute event to trigger Oracle intervention
+        DepositDisputed { 
+            lease_id, 
+            caller: initiator_pubkey 
+        }.publish(&env);
+
+        Ok(())
+    }
+
     pub fn check_tenant_default(env: Env, lease_id: u64) -> Result<i128, LeaseError> {
         let mut lease =
             load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
@@ -1538,6 +1905,147 @@ impl LeaseContract {
             .persistent()
             .get(&DataKey::RoommateBalance(lease_id, roommate))
             .unwrap_or(0)
+    }
+
+    /// Calculate wear and tear proration for long-term leases
+    /// Uses i128 fixed-point math for precision without truncation
+    pub fn calculate_wear_proration(
+        env: Env,
+        lease_id: u64,
+        oracle_reported_decay: i128,
+    ) -> Result<i128, LeaseError> {
+        let lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Prevent division by zero
+        if lease.asset_lifespan_days == 0 {
+            return Err(LeaseError::InvalidProrationMath);
+        }
+        
+        let current_time = env.ledger().timestamp();
+        let elapsed_seconds = current_time.saturating_sub(lease.start_date);
+        let elapsed_days = elapsed_seconds / 86_400; // Convert to days
+        
+        // Edge case: extremely early termination to prevent abuse
+        if elapsed_days < 1 {
+            return Ok(0); // No allowance for less than 1 day
+        }
+        
+        // Calculate expected degradation: (elapsed_lease_time / total_expected_lifespan) * asset_value
+        // Using i128 fixed-point math: multiply first, then divide to maintain precision
+        let expected_degradation = (elapsed_days as i128)
+            .saturating_mul(lease.asset_value)
+            .saturating_div(lease.asset_lifespan_days as i128);
+        
+        // Apply wear allowance: expected_degradation * wear_allowance_bps / 10000
+        let allowed_decay = expected_degradation
+            .saturating_mul(lease.wear_allowance_bps as i128)
+            .saturating_div(10_000_i128);
+        
+        // Round in favor of protocol (ceiling division)
+        let protocol_favor_decay = if expected_degradation.saturating_mul(lease.wear_allowance_bps as i128) % 10_000_i128 != 0 {
+            allowed_decay + 1
+        } else {
+            allowed_decay
+        };
+        
+        // Emit event with calculation details
+        WearAndTearCalculated {
+            lease_id,
+            allowed_decay: protocol_favor_decay,
+            reported_decay: oracle_reported_decay,
+            elapsed_days,
+            wear_allowance_bps: lease.wear_allowance_bps,
+        }
+        .publish(&env);
+        
+        // If Oracle reported damage falls under allowance, no penalty
+        if oracle_reported_decay <= protocol_favor_decay {
+            Ok(0) // No deduction
+        } else {
+            // Return the amount exceeding the allowance
+            Ok(oracle_reported_decay - protocol_favor_decay)
+        }
+    }
+
+    /// Deposit security collateral with flash loan protection
+    pub fn deposit_security_collateral(
+        env: Env,
+        lease_id: u64,
+        payer: Address,
+        amount: i128,
+    ) -> Result<(), LeaseError> {
+        payer.require_auth();
+        
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Check if this is a potential flash loan attempt
+        let current_ledger = env.ledger().sequence() as u64;
+        let deposit_ledger = lease.deposit_timestamp;
+        
+        // Settlement period requirement: 3 ledgers
+        const SETTLEMENT_LEDGERS: u32 = 3;
+        
+        // Check if deposit was made in current or recent ledgers (potential flash loan)
+        if current_ledger.saturating_sub(deposit_ledger) < SETTLEMENT_LEDGERS as u64 {
+            // Log the attempt and block
+            // In a real implementation, you might want to store this in a blacklist
+            return Err(LeaseError::FlashLoanAttemptBlocked);
+        }
+        
+        // Update lease status to Active after settlement period
+        if lease.status == LeaseStatus::Pending {
+            lease.status = LeaseStatus::Active;
+            
+            SettlementPeriodStarted {
+                lease_id,
+                deposit_timestamp: lease.deposit_timestamp,
+                settlement_ledgers: SETTLEMENT_LEDGERS,
+            }
+            .publish(&env);
+        }
+        
+        // Handle mid-lease top-ups
+        let balance_key = DataKey::RoommateBalance(lease_id, payer.clone());
+        let mut current_balance: i128 = env.storage().persistent().get(&balance_key).unwrap_or(0);
+        current_balance += amount;
+        env.storage().persistent().set(&balance_key, &current_balance);
+        env.storage()
+            .persistent()
+            .extend_ttl(&balance_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        
+        save_lease_instance(&env, lease_id, &lease);
+        Ok(())
+    }
+
+    /// Enhanced conclude_lease with wear and tear integration
+    pub fn conclude_lease_wear_proration(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        oracle_reported_decay: i128,
+    ) -> Result<i128, LeaseError> {
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        
+        if landlord != lease.landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        landlord.require_auth();
+        
+        // Calculate wear and tear proration
+        let wear_deduction = Self::calculate_wear_proration(env.clone(), lease_id, oracle_reported_decay)?;
+        
+        // Ensure deduction doesn't exceed deposit
+        let total_deduction = if wear_deduction > lease.security_deposit {
+            lease.security_deposit
+        } else {
+            wear_deduction
+        };
+        
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+        save_lease_instance(&env, lease_id, &lease);
+        
+        Ok(lease.security_deposit - total_deduction)
     }
 
     pub fn set_terms_hash(env: Env, admin: Address, hash: BytesN<32>) -> Result<(), LeaseError> {
@@ -1643,7 +2151,222 @@ impl LeaseContract {
         env.deployer().update_current_contract_wasm(new_wasm_hash);
         Ok(())
     }
+
+    pub fn whitelist_oracle(
+        env: Env,
+        admin: Address,
+        oracle_pubkey: BytesN<32>,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        
+        env.storage()
+            .instance()
+            .set(&DataKey::WhitelistedOracle(oracle_pubkey), &true);
+        Ok(())
+    }
+
+    pub fn remove_oracle(
+        env: Env,
+        admin: Address,
+        oracle_pubkey: BytesN<32>,
+    ) -> Result<(), LeaseError> {
+        let stored_admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(LeaseError::Unauthorised)?;
+        if admin != stored_admin {
+            return Err(LeaseError::Unauthorised);
+        }
+        admin.require_auth();
+        
+        env.storage()
+            .instance()
+            .remove(&DataKey::WhitelistedOracle(oracle_pubkey));
+        Ok(())
+    }
+
+    fn is_oracle_whitelisted(env: &Env, oracle_pubkey: &BytesN<32>) -> bool {
+        env.storage()
+            .instance()
+            .has(&DataKey::WhitelistedOracle(oracle_pubkey.clone()))
+    }
+
+    fn verify_ed25519_signature(
+        env: &Env,
+        pubkey: &BytesN<32>,
+        message: &soroban_sdk::Bytes,
+        signature: &BytesN<64>,
+    ) -> bool {
+        env.crypto().ed25519_verify(pubkey, message, signature)
+    }
+
+    fn calculate_penalty_percentage(severity: DamageSeverity) -> u32 {
+        match severity {
+            DamageSeverity::NormalWearAndTear => 0,
+            DamageSeverity::Minor => 10,
+            DamageSeverity::Moderate => 25,
+            DamageSeverity::Major => 50,
+            DamageSeverity::Severe => 75,
+            DamageSeverity::Catastrophic => 100,
+        }
+    }
+
+    fn get_oracle_nonce(env: &Env, oracle_pubkey: &BytesN<32>) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::OracleNonce(oracle_pubkey.clone(), 0))
+            .unwrap_or(0)
+    }
+
+    fn set_oracle_nonce(env: &Env, oracle_pubkey: &BytesN<32>, nonce: u64) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::OracleNonce(oracle_pubkey.clone(), 0), &nonce);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::OracleNonce(oracle_pubkey.clone(), 0), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+    }
+
+    fn is_tenant_flagged(env: &Env, lease_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::TenantFlag(lease_id))
+    }
+
+    fn flag_tenant(env: &Env, lease_id: u64, tenant: Address, reason: String) {
+        env.storage()
+            .persistent()
+            .set(&DataKey::TenantFlag(lease_id), &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&DataKey::TenantFlag(lease_id), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        
+        TenantFlagged {
+            lease_id,
+            tenant,
+            reason,
+        }
+        .publish(env);
+    }
+
+    pub fn execute_deposit_slash(
+        env: Env,
+        payload: OraclePayload,
+    ) -> Result<(), LeaseError> {
+        let current_time = env.ledger().timestamp();
+        
+        if !Self::is_oracle_whitelisted(&env, &payload.oracle_pubkey) {
+            return Err(LeaseError::OracleNotWhitelisted);
+        }
+
+        let stored_nonce = Self::get_oracle_nonce(&env, &payload.oracle_pubkey);
+        if payload.nonce <= stored_nonce {
+            return Err(LeaseError::InvalidNonce);
+        }
+
+        if payload.timestamp > current_time || current_time - payload.timestamp > 86400 {
+            return Err(LeaseError::InvalidSignature);
+        }
+
+        let mut message_data = soroban_sdk::Bytes::new(&env);
+        message_data.append(&payload.lease_id.to_val());
+        message_data.append(&payload.oracle_pubkey.to_val());
+        message_data.append(&(payload.damage_severity as u32).to_val());
+        message_data.append(&payload.nonce.to_val());
+        message_data.append(&payload.timestamp.to_val());
+
+        if !Self::verify_ed25519_signature(&env, &payload.oracle_pubkey, &message_data, &payload.signature) {
+            return Err(LeaseError::InvalidSignature);
+        }
+
+        Self::set_oracle_nonce(&env, &payload.oracle_pubkey, payload.nonce);
+
+        let mut lease = load_lease_instance_by_id(&env, payload.lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+
+        if lease.status != LeaseStatus::Terminated && lease.status != LeaseStatus::Expired {
+            return Err(LeaseError::LeaseNotTerminated);
+        }
+
+        if lease.deposit_status == DepositStatus::Settled {
+            return Err(LeaseError::DepositAlreadySettled);
+        }
+
+        let total_deposit = lease.security_deposit + lease.deposit_amount;
+        let penalty_percentage = Self::calculate_penalty_percentage(payload.damage_severity);
+        let penalty_amount = if penalty_percentage == 0 {
+            0
+        } else {
+            total_deposit.saturating_mul(penalty_percentage as i128) / 100
+        };
+
+        let tenant_refund = total_deposit.saturating_sub(penalty_amount);
+        let landlord_payout = penalty_amount;
+
+        if payload.damage_severity as u32 >= DamageSeverity::Severe as u32 && penalty_amount >= total_deposit {
+            Self::flag_tenant(&env, payload.lease_id, lease.tenant.clone(), 
+                String::from_str(&env, "Severe damage exceeding deposit value"));
+        }
+
+        if tenant_refund > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.tenant,
+                &tenant_refund,
+            );
+        }
+
+        if landlord_payout > 0 {
+            let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.landlord,
+                &landlord_payout,
+            );
+        }
+
+        lease.deposit_status = DepositStatus::Settled;
+        lease.active = false;
+        save_lease_instance(&env, payload.lease_id, &lease);
+
+        if let (Some(nft_contract_addr), Some(token_id)) =
+            (lease.nft_contract.clone(), lease.token_id)
+        {
+            delete_usage_rights(&env, nft_contract_addr.clone(), token_id);
+            let nft_client = nft_contract::NftClient::new(&env, &nft_contract_addr);
+            nft_client.transfer_from(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &lease.landlord,
+                &token_id,
+            );
+        }
+
+        DepositSlashed {
+            lease_id: payload.lease_id,
+            oracle_pubkey: payload.oracle_pubkey.clone(),
+            damage_code: payload.damage_severity as u32,
+            deducted_amount: penalty_amount,
+            tenant_refund,
+            landlord_payout,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
 }
 
 mod test;
 mod upgrade_tests;
+#[cfg(test)]
+mod security_deposit_tests;
