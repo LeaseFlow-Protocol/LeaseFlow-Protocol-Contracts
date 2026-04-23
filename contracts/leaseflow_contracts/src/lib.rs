@@ -203,6 +203,7 @@ pub struct LeaseInstance {
     pub has_pet: bool,
     pub pet_deposit_amount: i128,
     pub pet_rent_amount: i128,
+    pub last_tenant_interaction: u64,
 }
 
 #[contracttype]
@@ -422,42 +423,12 @@ pub struct CrossAssetDepositLocked {
 }
 
 #[contractevent]
-pub struct LeaseSigned {
+pub struct DepositSeizedForAbandonment {
     pub lease_id: u64,
-    pub property_hash: String,
-}
-
-#[contractevent]
-pub struct PaymentLate {
-    pub lease_id: u64,
-    pub days_late: u64,
-    pub current_fine: i128,
-}
-
-#[contractevent]
-pub struct MutualLeaseFinalized {
-    pub lease_id: u64,
-    pub return_amount: i128,
-    pub slash_amount: i128,
-    pub tenant_refund: i128,
-    pub landlord_payout: i128,
-}
-
-#[contractevent]
-pub struct DepositSlashed {
-    pub lease_id: u64,
-    pub oracle_pubkey: BytesN<32>,
-    pub damage_code: u32,
-    pub deducted_amount: i128,
-    pub tenant_refund: i128,
-    pub landlord_payout: i128,
-}
-
-#[contractevent]
-pub struct TenantFlagged {
-    pub lease_id: u64,
+    pub landlord: Address,
     pub tenant: Address,
-    pub reason: String,
+    pub deposit_amount: i128,
+    pub seizure_timestamp: u64,
 }
 
 #[contracterror]
@@ -481,12 +452,7 @@ pub enum LeaseError {
     UpgradeNotAllowed = 16,
     PathPaymentFailed = 17,
     SlippageExceeded = 18,
-    InvalidReleaseMath = 19,
-    OracleNotWhitelisted = 20,
-    InvalidSignature = 21,
-    InvalidNonce = 22,
-    LeaseNotTerminated = 23,
-    DepositAlreadySettled = 24,
+    AbandonmentChallenge = 19,
 }
 
 macro_rules! require {
@@ -1254,6 +1220,7 @@ impl LeaseContract {
             has_pet: params.has_pet,
             pet_deposit_amount: params.pet_deposit_amount,
             pet_rent_amount: params.pet_rent_amount,
+            last_tenant_interaction: env.ledger().timestamp(),
         };
         save_lease_instance(&env, lease_id, &lease);
         LeaseSigned {
@@ -1261,6 +1228,16 @@ impl LeaseContract {
             property_hash: params.property_uri.clone(),
         }
         .publish(&env);
+        Ok(())
+    }
+
+    fn update_tenant_heartbeat(env: &Env, lease_id: u64, tenant: &Address) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        if lease.tenant != *tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        lease.last_tenant_interaction = env.ledger().timestamp();
+        save_lease_instance(env, lease_id, &lease);
         Ok(())
     }
 
@@ -1305,6 +1282,11 @@ impl LeaseContract {
             .unwrap_or(false);
         if !is_primary && !is_authorized {
             return Err(LeaseError::Unauthorised);
+        }
+
+        // Update tenant heartbeat if this is the tenant paying
+        if is_primary {
+            update_tenant_heartbeat(&env, lease_id, &payer)?;
         }
 
         let balance_key = DataKey::RoommateBalance(lease_id, payer.clone());
@@ -1503,6 +1485,10 @@ impl LeaseContract {
             return Err(LeaseError::Unauthorised);
         }
         tenant.require_auth();
+        
+        // Update tenant heartbeat
+        update_tenant_heartbeat(&env, lease_id, &tenant)?;
+        
         lease.maintenance_status = MaintenanceStatus::Reported;
         save_lease_instance(&env, lease_id, &lease);
         MaintenanceIssueReported { lease_id, tenant }.publish(&env);
@@ -2077,340 +2063,63 @@ impl LeaseContract {
         Ok(())
     }
 
-    // Helper function to calculate required deposit based on asset tier and lease duration
-    fn calculate_required_deposit(
-        env: &Env,
-        asset_tier: AssetTier,
-        lease_duration: u64,
-        base_amount: i128,
-    ) -> i128 {
-        let duration_multiplier = if lease_duration <= 30 * 24 * 60 * 60 { // <= 30 days
-            1_00 // 1.0x
-        } else if lease_duration <= 90 * 24 * 60 * 60 { // <= 90 days
-            1_50 // 1.5x
-        } else if lease_duration <= 180 * 24 * 60 * 60 { // <= 180 days
-            2_00 // 2.0x
-        } else {
-            3_00 // 3.0x
-        };
-
-        let tier_multiplier = match asset_tier {
-            AssetTier::Low => 50,      // 0.5x
-            AssetTier::Medium => 100,   // 1.0x
-            AssetTier::High => 200,     // 2.0x
-            AssetTier::Luxury => 500,   // 5.0x
-        };
-
-        base_amount * duration_multiplier * tier_multiplier / 10_000
-    }
-
-    // Helper function to get or initialize the escrow vault
-    fn get_or_init_escrow_vault(env: &Env) -> EscrowVault {
-        if let Some(vault) = env.storage().persistent().get(&DataKey::EscrowVault) {
-            vault
-        } else {
-            let default_max_tvl = env.storage().persistent().get(&DataKey::MaxProtocolTVL)
-                .unwrap_or(10_000_000_000_000i128); // Default 10M tokens in stroops
-            EscrowVault {
-                total_locked: 0,
-                lease_count: 0,
-                max_capacity: default_max_tvl,
-                supported_assets: Vec::new(env),
-            }
-        }
-    }
-
-    // Helper function to save escrow vault state
-    fn save_escrow_vault(env: &Env, vault: &EscrowVault) {
-        env.storage().persistent().set(&DataKey::EscrowVault, vault);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::EscrowVault, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
-    }
-
-    // Helper function to get asset tier for a given asset
-    fn get_asset_tier(env: &Env, asset_address: &Address) -> AssetTier {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AssetTier(asset_address.clone()))
-            .unwrap_or(AssetTier::Medium) // Default to Medium tier
-    }
-
-    // Main function to deposit security collateral
-    pub fn deposit_security_collateral(
+    pub fn claim_abandoned_deposit(
         env: Env,
         lease_id: u64,
-        lessee: Address,
-        asset_address: Address,
-        deposit_amount: i128,
-        lease_duration: u64,
-        multi_asset_collateral: Option<MultiAssetCollateral>,
+        landlord: Address,
     ) -> Result<(), LeaseError> {
-        // Authenticate the lessee
-        lessee.require_auth();
+        landlord.require_auth();
         
-        // Check if lease exists and is in Pending state
-        let mut lease = load_lease_instance_by_id(&env, lease_id)
-            .ok_or(LeaseError::LeaseNotFound)?;
+        let mut lease = load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
         
-        if lease.tenant != lessee {
+        // Only landlord can claim abandoned deposit
+        if lease.landlord != landlord {
             return Err(LeaseError::Unauthorised);
         }
         
-        if lease.status != LeaseStatus::Pending {
-            return Err(LeaseError::Unauthorised); // Cannot deposit after lease is active
+        // Lease must be in Expired status
+        if lease.status != LeaseStatus::Expired {
+            return Err(LeaseError::LeaseNotExpired);
         }
-
-        // Get asset tier and calculate required deposit
-        let asset_tier = Self::get_asset_tier(&env, &asset_address);
-        let required_deposit = Self::calculate_required_deposit(
-            &env,
-            asset_tier.clone(),
-            lease_duration,
-            deposit_amount,
-        );
-
-        // Verify exact deposit amount
-        if deposit_amount != required_deposit {
-            return Err(LeaseError::InvalidDeduction);
+        
+        let current_time = env.ledger().timestamp();
+        const ABANDONMENT_GRACE_PERIOD: u64 = 30 * 24 * 60 * 60; // 30 days in seconds
+        
+        // Check if lease has been expired for at least 30 days
+        if lease.end_date + ABANDONMENT_GRACE_PERIOD > current_time {
+            return Err(LeaseError::LeaseNotExpired);
         }
-
-        // Check TVL bounds
-        let mut vault = Self::get_or_init_escrow_vault(&env);
-        if vault.total_locked.saturating_add(deposit_amount) > vault.max_capacity {
-            return Err(LeaseError::EscrowCapacityExceeded);
+        
+        // Check if tenant has any interaction within the 30-day window
+        let abandonment_deadline = lease.end_date + ABANDONMENT_GRACE_PERIOD;
+        if lease.last_tenant_interaction > abandonment_deadline {
+            return Err(LeaseError::AbandonmentChallenge);
         }
-
-        // Handle multi-asset collateral if provided
-        let total_collateral_value = if let Some(multi_asset) = multi_asset_collateral {
-            // For now, we'll handle primary asset only
-            // NFT collateral would be handled separately in a full implementation
-            deposit_amount.saturating_add(multi_asset.secondary_amount.unwrap_or(0))
-        } else {
-            deposit_amount
-        };
-
-        // Final TVL check with multi-asset collateral
-        if vault.total_locked.saturating_add(total_collateral_value) > vault.max_capacity {
-            return Err(LeaseError::EscrowCapacityExceeded);
-        }
-
-        // Transfer tokens to contract (escrow)
-        let token_client = token_contract::TokenClient::new(&env, &asset_address);
-        token_client.transfer(&lessee, &env.current_contract_address(), &deposit_amount);
-
-        // Handle secondary asset if present
-        if let Some(multi_asset) = &multi_asset_collateral {
-            if let (Some(secondary_asset), Some(secondary_amount)) = 
-                (&multi_asset.secondary_asset, multi_asset.secondary_amount) {
-                let secondary_token_client = token_contract::TokenClient::new(&env, secondary_asset);
-                secondary_token_client.transfer(&lessee, &env.current_contract_address(), secondary_amount);
-            }
-        }
-
-        // Create security deposit record
-        let security_deposit = SecurityDeposit {
-            lease_id,
-            lessee: lessee.clone(),
-            lessor: lease.landlord.clone(),
-            asset_address: asset_address.clone(),
-            amount: deposit_amount,
-            locked_at: env.ledger().timestamp(),
-            status: DepositStatus::Held,
-            asset_tier,
-        };
-
-        // Save security deposit to persistent storage
-        env.storage().persistent().set(&DataKey::SecurityDeposit(lease_id), &security_deposit);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::SecurityDeposit(lease_id), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
-
-        // Update vault state
-        vault.total_locked += total_collateral_value;
-        vault.lease_count += 1;
-        Self::save_escrow_vault(&env, &vault);
-
-        // Update lease instance
-        lease.security_deposit = deposit_amount;
-        lease.deposit_status = DepositStatus::Held;
+        
+        // All conditions met - seize the deposit
+        let deposit_amount = lease.security_deposit;
+        
+        // Update lease status and deposit status
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+        lease.active = false;
+        
         save_lease_instance(&env, lease_id, &lease);
-
-        // Emit event
-        SecurityDepositLocked {
+        
+        // Emit event for public record
+        DepositSeizedForAbandonment {
             lease_id,
-            lessee,
-            lessor: lease.landlord,
-            asset_id: asset_address,
-            collateral_volume: deposit_amount,
+            landlord: lease.landlord.clone(),
+            tenant: lease.tenant.clone(),
+            deposit_amount,
+            seizure_timestamp: current_time,
         }
         .publish(&env);
-
+        
+        // Archive the lease to maintain ledger hygiene
+        archive_lease(&env, lease_id, lease, landlord);
+        
         Ok(())
-    }
-
-    // Admin function to set max protocol TVL
-    pub fn set_max_protocol_tvl(
-        env: Env,
-        admin: Address,
-        max_tvl: i128,
-    ) -> Result<(), LeaseError> {
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(LeaseError::Unauthorised)?;
-        if admin != stored_admin {
-            return Err(LeaseError::Unauthorised);
-        }
-        admin.require_auth();
-        
-        env.storage().persistent().set(&DataKey::MaxProtocolTVL, &max_tvl);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::MaxProtocolTVL, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
-        Ok(())
-    }
-
-    // Admin function to set asset tier
-    pub fn set_asset_tier(
-        env: Env,
-        admin: Address,
-        asset_address: Address,
-        tier: AssetTier,
-    ) -> Result<(), LeaseError> {
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(LeaseError::Unauthorised)?;
-        if admin != stored_admin {
-            return Err(LeaseError::Unauthorised);
-        }
-        admin.require_auth();
-        
-        env.storage().persistent().set(&DataKey::AssetTier(asset_address), &tier);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::AssetTier(asset_address), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
-        Ok(())
-    }
-
-    // Function to get security deposit info
-    pub fn get_security_deposit(env: Env, lease_id: u64) -> Result<SecurityDeposit, LeaseError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::SecurityDeposit(lease_id))
-            .ok_or(LeaseError::LeaseNotFound)
-    }
-
-    // Function to get escrow vault info
-    pub fn get_escrow_vault(env: Env) -> EscrowVault {
-        Self::get_or_init_escrow_vault(&env)
-    }
-
-    // Security function to check if deposit can be accessed
-    fn can_access_deposit(
-        env: &Env,
-        lease_id: u64,
-        caller: &Address,
-    ) -> Result<bool, LeaseError> {
-        let lease = load_lease_instance_by_id(env, lease_id)
-            .ok_or(LeaseError::LeaseNotFound)?;
-        
-        let security_deposit = env.storage()
-            .persistent()
-            .get(&DataKey::SecurityDeposit(lease_id))
-            .ok_or(LeaseError::LeaseNotFound)?;
-        
-        // Only allow access if:
-        // 1. Lease is not active (expired or terminated)
-        // 2. Deposit is not in Held status (must be Settled or Disputed)
-        // 3. Caller is the lessee (tenant) or an authorized arbitrator
-        
-        let lease_inactive = lease.status != LeaseStatus::Active;
-        let deposit_not_held = security_deposit.status != DepositStatus::Held;
-        let is_lessee = caller == &security_deposit.lessee;
-        let is_arbitrator = lease.arbitrators.contains(caller);
-        
-        // Lessors CANNOT access deposits during active leases
-        let is_lessor = caller == &security_deposit.lessor;
-        if is_lessor && lease.status == LeaseStatus::Active {
-            return Ok(false); // Explicitly deny lessor access during active lease
-        }
-        
-        Ok(lease_inactive && (deposit_not_held || is_lessee || is_arbitrator))
-    }
-
-    // Function to release security deposit (only when conditions are met)
-    pub fn release_security_deposit(
-        env: Env,
-        lease_id: u64,
-        caller: Address,
-        damage_deduction: i128,
-    ) -> Result<i128, LeaseError> {
-        caller.require_auth();
-        
-        // Check access permissions
-        if !Self::can_access_deposit(&env, lease_id, &caller)? {
-            return Err(LeaseError::Unauthorised);
-        }
-        
-        let mut lease = load_lease_instance_by_id(&env, lease_id)
-            .ok_or(LeaseError::LeaseNotFound)?;
-        
-        let mut security_deposit = env.storage()
-            .persistent()
-            .get(&DataKey::SecurityDeposit(lease_id))
-            .ok_or(LeaseError::LeaseNotFound)?;
-        
-        // Validate damage deduction
-        if damage_deduction < 0 || damage_deduction > security_deposit.amount {
-            return Err(LeaseError::InvalidDeduction);
-        }
-        
-        // Calculate refund amount
-        let refund_amount = security_deposit.amount - damage_deduction;
-        
-        // Update vault state
-        let mut vault = Self::get_or_init_escrow_vault(&env);
-        vault.total_locked = vault.total_locked.saturating_sub(security_deposit.amount);
-        vault.lease_count = vault.lease_count.saturating_sub(1);
-        Self::save_escrow_vault(&env, &vault);
-        
-        // Transfer refund back to lessee
-        if refund_amount > 0 {
-            let token_client = token_contract::TokenClient::new(&env, &security_deposit.asset_address);
-            token_client.transfer(
-                &env.current_contract_address(),
-                &security_deposit.lessee,
-                &refund_amount,
-            );
-        }
-        
-        // Transfer damage deduction to lessor if applicable
-        if damage_deduction > 0 {
-            let token_client = token_contract::TokenClient::new(&env, &security_deposit.asset_address);
-            token_client.transfer(
-                &env.current_contract_address(),
-                &security_deposit.lessor,
-                &damage_deduction,
-            );
-        }
-        
-        // Update statuses
-        security_deposit.status = DepositStatus::Settled;
-        lease.deposit_status = DepositStatus::Settled;
-        
-        // Save updated state
-        env.storage().persistent().set(&DataKey::SecurityDeposit(lease_id), &security_deposit);
-        env.storage()
-            .persistent()
-            .extend_ttl(&DataKey::SecurityDeposit(lease_id), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
-        
-        save_lease_instance(&env, lease_id, &lease);
-        
-        Ok(refund_amount)
     }
 
     pub fn upgrade(
