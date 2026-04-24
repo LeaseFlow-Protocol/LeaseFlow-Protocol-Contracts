@@ -13,6 +13,9 @@ use soroban_sdk::{
 mod velocity_guard;
 use velocity_guard::VelocityGuard;
 
+#[cfg(test)]
+mod velocity_guard_tests;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RateType {
@@ -1112,6 +1115,11 @@ impl LeaseContract {
             pet_rent_amount: params.pet_rent_amount,
         };
         save_lease_instance(&env, lease_id, &lease);
+
+        // Initialize velocity tracker for landlord and update portfolio size
+        VelocityGuard::initialize_lessor(&env, &landlord)?;
+        VelocityGuard::update_portfolio_size(&env, &landlord, 1)?;
+
         LeaseSigned {
             lease_id,
             property_hash: params.property_uri.clone(),
@@ -1286,6 +1294,135 @@ impl LeaseContract {
 
         archive_lease(&env, lease_id, lease, caller);
         LeaseTerminated { lease_id }.publish(&env);
+        Ok(())
+    }
+
+    pub fn execute_early_termination(
+        env: Env,
+        lease_id: u64,
+        caller: Address,
+    ) -> Result<(), LeaseError> {
+        caller.require_auth();
+
+        let mut lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+
+        // Verify caller is authorized (tenant or landlord)
+        if caller != lease.tenant && caller != lease.landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+
+        // Check if lease is already terminated
+        if lease.status == LeaseStatus::Terminated {
+            return Err(LeaseError::LeaseNotTerminated);
+        }
+
+        // Initialize velocity tracker for lessor if needed
+        VelocityGuard::initialize_lessor(&env, &lease.landlord)?;
+
+        // Check velocity limits before allowing termination
+        VelocityGuard::check_velocity_limits(&env, &lease.landlord)?;
+
+        // Calculate early termination penalty
+        let current_time = env.ledger().timestamp();
+        let total_duration = lease.end_date - lease.start_date;
+        let elapsed_time = current_time - lease.start_date;
+        let remaining_time = lease.end_date - current_time;
+
+        let penalty_amount = if let (Some(fee_bps), Some(fixed_penalty)) = 
+            (lease.early_termination_fee_bps, lease.fixed_penalty) {
+            // If both are configured, use the higher amount
+            let percentage_penalty = if fee_bps > 0 && remaining_time > 0 {
+                let remaining_value = remaining_time as i128 * lease.rent_per_sec;
+                remaining_value * fee_bps as i128 / 10_000
+            } else {
+                0
+            };
+            percentage_penalty.max(fixed_penalty)
+        } else if let Some(fee_bps) = lease.early_termination_fee_bps {
+            // Percentage-based penalty
+            if fee_bps > 0 && remaining_time > 0 {
+                let remaining_value = remaining_time as i128 * lease.rent_per_sec;
+                remaining_value * fee_bps as i128 / 10_000
+            } else {
+                0
+            }
+        } else if let Some(fixed_penalty) = lease.fixed_penalty {
+            // Fixed penalty
+            fixed_penalty
+        } else {
+            // No penalty configured
+            0
+        };
+
+        // Cap penalty at total deposit amount
+        let total_deposit = lease.security_deposit + lease.deposit_amount;
+        let final_penalty = penalty_amount.min(total_deposit);
+
+        // Calculate refund amounts
+        let tenant_refund = total_deposit - final_penalty;
+        let landlord_payout = final_penalty;
+
+        // Execute transfers
+        let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
+        
+        if tenant_refund > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.tenant,
+                &tenant_refund,
+            );
+        }
+
+        if landlord_payout > 0 {
+            token_client.transfer(
+                &env.current_contract_address(),
+                &lease.landlord,
+                &landlord_payout,
+            );
+        }
+
+        // Update lease status
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+        lease.active = false;
+
+        // Handle NFT if present
+        if let (Some(nft_contract), Some(token_id)) = 
+            (lease.nft_contract.clone(), lease.token_id) {
+            let nft_client = nft_contract::NftClient::new(&env, &nft_contract);
+            nft_client.transfer_from(
+                &env.current_contract_address(),
+                &env.current_contract_address(),
+                &lease.landlord,
+                &token_id,
+            );
+        }
+
+        // Record termination for velocity tracking
+        VelocityGuard::record_termination(&env, &lease.landlord, lease_id)?;
+
+        // Update portfolio size
+        VelocityGuard::update_portfolio_size(&env, &lease.landlord, -1)?;
+
+        // Archive lease
+        archive_lease(&env, lease_id, lease, caller);
+
+        // Get velocity stats for event
+        let (portfolio_size, velocity_24h, _, _) = VelocityGuard::get_velocity_stats(&env, &lease.landlord)?;
+
+        // Emit events
+        LeaseTerminated { lease_id }.publish(&env);
+        LeaseTerminatedWithVelocityGuard {
+            lease_id,
+            lessor: lease.landlord,
+            tenant: lease.tenant,
+            terminated_by: caller,
+            timestamp: current_time,
+            portfolio_size,
+            velocity_24h,
+        }.publish(&env);
+
         Ok(())
     }
 
@@ -1907,6 +2044,17 @@ impl LeaseContract {
         Ok(())
     }
 
+    pub fn dao_approve_resume(
+        env: Env,
+        dao_member: Address,
+        lessor: Address,
+        request_id: u64,
+    ) -> Result<(), LeaseError> {
+        dao_member.require_auth();
+        
+        VelocityGuard::dao_approve_resume(&env, &dao_member, &lessor, request_id)
+    }
+
     fn verify_ed25519_signature(
         env: &Env,
         pubkey: &BytesN<32>,
@@ -2008,6 +2156,12 @@ impl LeaseContract {
             return Err(LeaseError::DepositAlreadySettled);
         }
 
+        // Initialize velocity tracker for lessor if needed
+        VelocityGuard::initialize_lessor(&env, &lease.landlord)?;
+
+        // Check velocity limits before allowing deposit slash
+        VelocityGuard::check_velocity_limits(&env, &lease.landlord)?;
+
         let total_deposit = lease.security_deposit + lease.deposit_amount;
         let penalty_percentage = Self::calculate_penalty_percentage(payload.damage_severity);
         let penalty_amount = if penalty_percentage == 0 {
@@ -2046,6 +2200,12 @@ impl LeaseContract {
         lease.active = false;
         save_lease_instance(&env, payload.lease_id, &lease);
 
+        // Record deposit slash for velocity tracking
+        VelocityGuard::record_termination(&env, &lease.landlord, payload.lease_id)?;
+
+        // Update portfolio size
+        VelocityGuard::update_portfolio_size(&env, &lease.landlord, -1)?;
+
         if let (Some(nft_contract_addr), Some(token_id)) =
             (lease.nft_contract.clone(), lease.token_id)
         {
@@ -2058,6 +2218,9 @@ impl LeaseContract {
                 &token_id,
             );
         }
+
+        // Get velocity stats for event
+        let (portfolio_size, velocity_24h, _, _) = VelocityGuard::get_velocity_stats(&env, &lease.landlord)?;
 
         DepositSlashed {
             lease_id: payload.lease_id,
