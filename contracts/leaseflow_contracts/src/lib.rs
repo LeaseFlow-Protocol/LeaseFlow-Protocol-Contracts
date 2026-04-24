@@ -2307,3 +2307,8 @@ impl LeaseContract {
 
 mod test;
 mod upgrade_tests;
+
+// Global Escrow Freeze Circuit Breaker Modules
+pub mod escrow_vault;
+pub mod continuous_billing_module;
+pub mod escrow_freeze_tests;
