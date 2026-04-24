@@ -9,6 +9,15 @@ on:
     # Run formal verification daily at 2 AM UTC
     - cron: '0 2 * * *'
 
+# --- THE FIX: Explicitly grant the GITHUB_TOKEN the required access ---
+permissions:
+  contents: read
+  statuses: write
+  issues: write
+  pull-requests: write
+  checks: write
+# ----------------------------------------------------------------------
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -37,8 +46,8 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz
 
-      - name: Install proptest
-        run: cargo install proptest
+      # - name: Install proptest
+      #   run: cargo install proptest
 
       - name: Check Formatting
         run: cargo fmt --check
