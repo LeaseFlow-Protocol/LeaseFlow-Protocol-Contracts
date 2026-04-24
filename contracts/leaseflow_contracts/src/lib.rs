@@ -16,8 +16,17 @@ use velocity_guard::VelocityGuard;
 mod continuous_billing_module;
 use continuous_billing_module::ContinuousBillingModule;
 
+mod lessee_access_token;
+use lessee_access_token::LesseeAccessTokenManager;
+
+mod derived_access_token;
+use derived_access_token::DerivedAccessTokenManager;
+
 #[cfg(test)]
 mod velocity_guard_tests;
+
+#[cfg(test)]
+mod derived_access_token_tests;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1402,6 +1411,23 @@ impl LeaseContract {
                 }
                 .publish(&env);
             }
+        }
+
+        // Cascade burn all derived tokens before archiving
+        if let Some(access_token_id) = lease.token_id {
+            // Burn all derived tokens in the hierarchy
+            let _ = DerivedAccessTokenManager::recursive_burn_hierarchy(
+                env.clone(),
+                access_token_id,
+                crate::lessee_access_token::RevocationReason::LeaseTerminated,
+            );
+            
+            // Revoke the root access token
+            let _ = LesseeAccessTokenManager::revoke_access_token(
+                env.clone(),
+                lease_id,
+                crate::lessee_access_token::RevocationReason::LeaseTerminated,
+            );
         }
 
         archive_lease(&env, lease_id, lease, caller);
@@ -2886,6 +2912,85 @@ impl LeaseContract {
             .persistent()
             .get(&DataKey::YieldAccumulated(lease_id))
             .unwrap_or(0)
+    }
+
+    // Derived Access Token Management Functions
+    
+    /// Mint a derived access token for sub-lessee
+    pub fn mint_derived_access_token(
+        env: Env,
+        request: crate::derived_access_token::DerivedTokenRequest,
+    ) -> Result<u128, LeaseError> {
+        DerivedAccessTokenManager::mint_derived_access_token(env, request)
+            .map_err(|_| LeaseError::Unauthorised)
+    }
+
+    /// Transfer a derived access token
+    pub fn transfer_derived_access_token(
+        env: Env,
+        token_id: u128,
+        from_sublessee: Address,
+        to_sublessee: Address,
+        transfer_reason: String,
+    ) -> Result<(), LeaseError> {
+        DerivedAccessTokenManager::transfer_derived_token(env, token_id, from_sublessee, to_sublessee, transfer_reason)
+            .map_err(|_| LeaseError::Unauthorised)
+    }
+
+    /// Update spatial zone for derived token
+    pub fn update_derived_token_spatial_zone(
+        env: Env,
+        token_id: u128,
+        new_zone: crate::derived_access_token::SpatialZone,
+    ) -> Result<(), LeaseError> {
+        DerivedAccessTokenManager::update_spatial_zone(env, token_id, new_zone)
+            .map_err(|_| LeaseError::Unauthorised)
+    }
+
+    /// Get derived access token by ID
+    pub fn get_derived_access_token(
+        env: Env,
+        token_id: u128,
+    ) -> Result<crate::derived_access_token::DerivedAccessToken, LeaseError> {
+        DerivedAccessTokenManager::get_derived_token(env, token_id)
+            .map_err(|_| LeaseError::Unauthorised)
+    }
+
+    /// Get all derived tokens for a lease
+    pub fn get_lease_derived_tokens(env: Env, lease_id: u64) -> Vec<u128> {
+        DerivedAccessTokenManager::get_lease_derived_tokens(env, lease_id)
+    }
+
+    /// Get all derived tokens for a sublessee
+    pub fn get_sublessee_derived_tokens(env: Env, sublessee: Address) -> Vec<u128> {
+        DerivedAccessTokenManager::get_sublessee_derived_tokens(env, sublessee)
+    }
+
+    /// Get hierarchy metrics for a lease
+    pub fn get_derived_token_hierarchy_metrics(
+        env: Env,
+        lease_id: u64,
+    ) -> Result<crate::derived_access_token::HierarchyMetrics, LeaseError> {
+        DerivedAccessTokenManager::get_hierarchy_metrics(env, lease_id)
+            .map_err(|_| LeaseError::Unauthorised)
+    }
+
+    /// Check if derived token is valid
+    pub fn is_derived_token_valid(env: Env, token_id: u128) -> Result<bool, LeaseError> {
+        DerivedAccessTokenManager::is_derived_token_valid(env, token_id)
+            .map_err(|_| LeaseError::Unauthorised)
+    }
+
+    /// Recursively burn derived token hierarchy
+    pub fn burn_derived_token_hierarchy(
+        env: Env,
+        root_token_id: u128,
+    ) -> Result<u32, LeaseError> {
+        DerivedAccessTokenManager::recursive_burn_hierarchy(
+            env,
+            root_token_id,
+            crate::lessee_access_token::RevocationReason::LeaseTerminated,
+        ).map_err(|_| LeaseError::Unauthorised)
     }
 }
 
