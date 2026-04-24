@@ -1,223 +1,96 @@
-# LeaseFlow Protocol Contracts
+# Soroban Project
 
-Soroban smart contracts for real-time asset leasing with built-in grace period and delinquency management.
+## Project Structure
 
-## Overview
+This repository uses the recommended structure for a Soroban project:
 
-LeaseFlow manages the full lifecycle of a property lease on-chain — from creation through rent streaming to deposit settlement and lease closure. This implementation includes critical grace period functionality to handle temporary liquidity issues and prevent unfair evictions.
-
-## Features
-
-### Core Functionality
-- **Lease Creation**: Create leases with customizable terms (rent, deposit, duration)
-- **Lease Activation**: Lessee can activate lease by depositing security deposit
-- **Rent Processing**: Continuous rent payment streaming and processing
-- **Deposit Management**: Security deposit handling and final settlement
-
-### Grace Period & Delinquency Management (Issue #109)
-- **Grace Period State**: Automatic transition to grace period on payment failure
-- **Late Fee Calculation**: Configurable late fee rates (basis points)
-- **Recovery Logic**: Lease recovery during grace period with fee appending
-- **Eviction Protection**: Structured transition to eviction pending after grace period expiry
-- **Event Emission**: Comprehensive events for external notification systems
-
-### Security Features
-- **Time-based Protection**: Grace period math resistant to time manipulation
-- **Access Control**: Role-based authorization for lease operations
-- **State Validation**: Strict state machine transitions
-- **Error Handling**: Comprehensive error types for debugging
-
-## Contract Structure
-
-```
-contracts/leaseflow/
-├── src/
-│   ├── lib.rs          # Main contract implementation
-│   └── test.rs         # Comprehensive test suite
-└── Cargo.toml          # Contract dependencies
+```text
+.
+├── contracts
+│   └── hello_world
+│       ├── src
+│       │   ├── lib.rs
+│       │   └── test.rs
+│       └── Cargo.toml
+├── Cargo.toml
+└── README.md
 ```
 
-## Lease States
+- New Soroban contracts can be put in `contracts`, each in their own directory. There is already a `hello_world` contract in there to get you started.
+- If you initialized this project with any other example contracts via `--with-example`, those contracts will be in the `contracts` directory as well.
+- Contracts should have their own `Cargo.toml` files that rely on the top-level `Cargo.toml` workspace for their dependencies.
+- Frontend libraries can be added to the top-level directory as well. If you initialized this project with a frontend template via `--frontend-template` you will have those files already included.
 
-```rust
-pub enum LeaseState {
-    Pending,        // Lease created, waiting for activation
-    Active,         // Lease active, rent payments flowing
-    GracePeriod,    // Payment failed, grace period active
-    EvictionPending,// Grace period expired, eviction pending
-    Closed,         // Lease completed and closed
-}
+## Deployed Contract
+- **Network:** Stellar Testnet
+- **Contract ID:** CAEGD57WVTVQSYWYB23AISBW334QO7WNA5XQ56S45GH6BP3D2AVHKUG4
+
+## Protocol Flow
+
+LeaseFlow manages the full lifecycle of a property lease on-chain — from creation through rent streaming to deposit settlement and lease closure. The landlord initialises the lease with terms and a deposit requirement; the tenant activates it by funding the deposit; rent streams continuously to the landlord while the lease is active; and when the lease ends the protocol calculates the final settlement, releases the remaining deposit to the tenant, and closes the record. This design keeps funds non-custodial and settlement logic transparent at every step.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant L as Landlord
+    participant T as Tenant
+    participant P as LeaseFlow Protocol
+    participant S as Payment Stream
+
+    L->>P: create_lease(landlord, tenant, rent_amount, deposit_amount, start_date, end_date, property_uri)
+    P-->>L: LeaseCreated (status: Pending, lease record stored)
+
+    T->>P: activate_lease(lease_id) + deposit funds
+    P-->>T: LeaseActivated (status: Active, deposit_amount locked)
+
+    P->>S: start_stream(lease_id, rent_amount, recipient: landlord)
+    S-->>P: StreamActive (streaming rent each ledger tick)
+
+    loop Every ledger / payment interval
+        S->>L: stream rent payment (rent_amount per period)
+    end
+
+    T->>P: stop_stream(lease_id)
+    P->>S: halt_stream(lease_id)
+    S-->>P: StreamSettled (final_amount calculated)
+
+    P-->>T: release_deposit(lease_id) - remaining deposit refunded
+
+    T->>P: return_asset(lease_id)
+    P-->>L: AssetReturned (landlord notified)
+    P-->>T: LeaseClosed (status: Closed, lease record finalised)
 ```
 
-## Key Functions
+### Step-by-step breakdown
 
-### Lease Management
-- `create_lease()` - Create new lease with terms
-- `activate_lease()` - Activate lease with deposit
-- `get_lease()` - Retrieve lease information
-- `get_user_leases()` - Get all leases for a user
+1. **Landlord calls `create_lease`** — Passes tenant address, `rent_amount`, `deposit_amount`, `start_date`, `end_date`, and a `property_uri` (e.g. an IPFS link to the property listing). The protocol stores the lease record with status `Pending`.
 
-### Payment Processing
-- `process_rent_payment()` - Process rent payment (normal or recovery)
-- `handle_rent_payment_failure()` - Trigger grace period on payment failure
+2. **Protocol emits `LeaseCreated`** — The lease is registered in contract instance storage under the `lease` key. No funds move yet.
 
-### Grace Period Management
-- `check_grace_period_expiry()` - Check and handle grace period expiration
-- `trigger_grace_period_check()` - Manual grace period check (lessor only)
+3. **Tenant calls `activate_lease` and funds the deposit** — The tenant transfers `deposit_amount` to the contract. The protocol validates the amount and flips the lease status to `Active`.
 
-## Events
+4. **Protocol emits `LeaseActivated`** — Deposit is locked in the contract. The lease is now live and the payment stream can begin.
 
-### Lease Lifecycle Events
-- `LeaseCreated` - Emitted when lease is created
-- `LeaseActivated` - Emitted when lease becomes active
+5. **Protocol starts the payment stream** — Internally triggers `start_stream` with the agreed `rent_amount` rate and the landlord as recipient. The stream is tied to the lease record.
 
-### Grace Period Events
-- `RentDelinquencyStarted` - Emitted when grace period begins
-- `LeaseRecovered` - Emitted when lease recovers from delinquency
-- `EvictionPending` - Emitted when grace period expires
+6. **Stream flows each ledger tick** — Rent is continuously streamed from the locked funds to the landlord's address at the agreed rate for the duration of the lease.
 
-## Usage Example
+7. **Tenant signals end of lease via `stop_stream`** — Tenant calls the protocol to halt the stream, indicating they are ready to return the asset and close out.
 
-```rust
-// Create lease
-let lease_id = contract.create_lease(
-    &lessor,
-    &lessee,
-    &1000,           // rent amount
-    &2000,           // deposit amount
-    &start_date,
-    &end_date,
-    &432000,         // 5 day grace period
-    &500,            // 5% late fee rate
-    &property_uri,
-);
+8. **Protocol halts the stream and settles** — Calls `halt_stream` internally; the stream calculates the `final_amount` paid and reports back. Any unstreamed rent is reconciled.
 
-// Activate lease
-contract.activate_lease(&lease_id, &lessee);
+9. **Protocol releases remaining deposit to tenant** — After settlement, `release_deposit` returns the unused portion of `deposit_amount` to the tenant's address.
 
-// Process rent payment
-contract.process_rent_payment(&lease_id, &1000);
+10. **Tenant calls `return_asset`** — Signals that the physical or digital asset has been returned to the landlord. The protocol records this on-chain.
 
-// Handle payment failure (triggers grace period)
-contract.handle_rent_payment_failure(&lease_id);
+11. **Protocol closes the lease** — Emits `AssetReturned` to the landlord and `LeaseClosed` to the tenant. The lease status is set to `Closed` and the record is finalised in storage.
 
-// Recover during grace period (rent + late fees)
-contract.process_rent_payment(&lease_id, &1050);
-```
+### Edge cases
 
-## Grace Period Flow
+- **Tenant never returns the asset** — If `return_asset` is not called before the `end_date` + grace period, the protocol can slash all or part of the `deposit_amount` as a penalty and mark the lease `Defaulted`. See `test_deposit_release_disputed` for the disputed-return flow.
 
-1. **Payment Failure**: Rent payment fails → `Error::InsufficientRentFunds`
-2. **Grace Period Activation**: Lease transitions to `GracePeriod` state
-3. **Late Fee Calculation**: Late fees calculated and accumulated
-4. **Event Emission**: `RentDelinquencyStarted` event emitted
-5. **Recovery Window**: Lessee has `MAX_GRACE_PERIOD` to pay outstanding amount + fees
-6. **Recovery**: Full payment → `LeaseRecovered` event → return to `Active` state
-7. **Expiry**: Grace period expires → `EvictionPending` event → `EvictionPending` state
+- **Stream runs out of funds before lease ends** — If the tenant's deposited funds are exhausted before `end_date`, the stream halts automatically. The protocol records the shortfall; the landlord can claim the remaining deposit as partial compensation. See `test_deposit_release_partial_refund` for this scenario.
 
-## Configuration
+- **Landlord disputes the return condition** — If the landlord rejects the asset return (e.g. damage claim), the lease enters a `Disputed` state. The deposit is held in escrow until the dispute is resolved — either by on-chain arbitration logic or a manual settlement call. See `test_deposit_release_disputed` for the disputed-return snapshot.
 
-### Grace Period
-- **Default**: 5 days (432,000 seconds)
-- **Configurable**: Set per lease during creation
-- **Security**: Resistant to timestamp manipulation
-
-### Late Fees
-- **Rate**: Configurable in basis points (10000 = 100%)
-- **Calculation**: `rent_amount * (late_fee_rate / 10000)`
-- **Examples**:
-  - 500 basis points = 5% late fee
-  - 1000 basis points = 10% late fee
-  - 0 basis points = no late fee
-
-## Testing
-
-Run the comprehensive test suite:
-
-```bash
-cargo test --package leaseflow
-```
-
-### Test Coverage
-- ✅ Lease creation and activation
-- ✅ Grace period triggering and state transitions
-- ✅ Late fee calculation and edge cases
-- ✅ Recovery during grace period
-- ✅ Grace period expiry and eviction transition
-- ✅ Event emission verification
-- ✅ Authorization and access control
-- ✅ Multiple lease management
-- ✅ Wallet depletion simulation
-
-## Security Considerations
-
-### Time Manipulation Resistance
-- Grace period calculations use ledger timestamps
-- No timezone-based calculations
-- Immutable grace period duration
-
-### Access Control
-- Only lessee can activate lease
-- Only lessor can trigger manual grace period checks
-- State transition validation prevents unauthorized operations
-
-### Financial Safety
-- All payments require sufficient funds
-- Late fees calculated using safe math operations
-- Overflow protection in all calculations
-
-## Integration
-
-### External Services
-The contract emits events that can be consumed by:
-- Email notification systems
-- SMS alert services
-- Dashboard monitoring
-- Automated payment processors
-
-### Payment Streams
-Designed to integrate with continuous payment streams:
-- Stellar payment streams
-- Automated recurring payments
-- Wallet balance monitoring
-
-## Development
-
-### Building
-```bash
-cargo build --package leaseflow --target wasm32-unknown-unknown
-```
-
-### Testing
-```bash
-cargo test --package leaseflow
-```
-
-### Deployment
-Deploy to Stellar Testnet:
-```bash
-soroban contract deploy \
-  --wasm target/wasm32-unknown-unknown/release/leaseflow.wasm \
-  --source-account <ACCOUNT> \
-  --network testnet
-```
-
-## License
-
-MIT License - see LICENSE file for details.
-
-## Contributing
-
-1. Fork the repository
-2. Create feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass
-5. Submit pull request
-
-## Issues
-
-For bug reports and feature requests, please use the GitHub issue tracker.
-
----
-
-**Note**: This implementation addresses Issue #109 - Missed Payment Grace Period & Dunning State, providing a robust solution for handling temporary liquidity issues while protecting both lessor and lessee interests.
+>>>>>>> a39c6ebec0c7dbd10a185bb4e5e3e831392f0358
