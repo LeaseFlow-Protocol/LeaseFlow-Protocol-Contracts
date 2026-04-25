@@ -10,30 +10,35 @@ pub fn calculate_total_cost(duration_secs: u64, rate_per_sec: u64) -> Option<u64
 /// Handles leap years and varying month lengths automatically
 pub fn get_seconds_in_month(timestamp: u64) -> u64 {
     // Convert timestamp to Unix time (seconds since 1970-01-01)
-    // For Soroban, we'll use a simplified approach that works with the ledger timestamp
-    
-    // Parse the timestamp as Unix time
     let unix_time = timestamp as i64;
     
-    // Convert to days since epoch
+    // Calculate days since epoch
     let days_since_epoch = unix_time / 86400;
     
-    // Calculate year and day of year (simplified, ignoring leap seconds)
-    let mut year = 1970;
-    let mut remaining_days = days_since_epoch;
+    // Calculate year using efficient algorithm instead of loop
+    // Approximate years since 1970, then adjust
+    let mut year = 1970 + (days_since_epoch / 365) as i32;
+    let mut remaining_days = days_since_epoch % 365;
     
-    // Account for full years
-    while remaining_days >= 366 {
-        let days_in_year = if is_leap_year(year) { 366 } else { 365 };
-        if remaining_days >= days_in_year {
-            remaining_days -= days_in_year;
-            year += 1;
-        } else {
-            break;
-        }
+    // Adjust for leap years passed
+    let leap_years_before = (year - 1968) / 4 - (year - 1900) / 100 + (year - 1600) / 400;
+    remaining_days -= leap_years_before as i64;
+    
+    // Adjust year if we've gone too far
+    while remaining_days < 0 {
+        year -= 1;
+        let days_in_prev_year = if is_leap_year(year) { 366 } else { 365 };
+        remaining_days += days_in_prev_year;
     }
     
-    // Determine month based on remaining days
+    // Adjust year if we haven't gone far enough
+    while remaining_days >= (if is_leap_year(year) { 366 } else { 365 }) {
+        let days_in_current_year = if is_leap_year(year) { 366 } else { 365 };
+        remaining_days -= days_in_current_year;
+        year += 1;
+    }
+    
+    // Determine month based on remaining days in current year
     let month_days = if is_leap_year(year) {
         [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     } else {
