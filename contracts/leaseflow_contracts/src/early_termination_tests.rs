@@ -51,7 +51,6 @@ fn make_lease_with_early_termination_fees(
         status: LeaseStatus::Active,
         nft_contract: None,
         token_id: None,
-        active: true,
         rent_paid: 0,
         expiry_time: END,
         buyout_price: None,
@@ -63,12 +62,10 @@ fn make_lease_with_early_termination_fees(
         grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
-        flat_fee_applied: false,
         seconds_late_charged: 0,
         withdrawal_address: None,
         rent_withdrawn: 0,
         arbitrators: soroban_sdk::Vec::new(env),
-        paused: false,
         pause_reason: None,
         paused_at: None,
         pause_initiator: None,
@@ -76,14 +73,12 @@ fn make_lease_with_early_termination_fees(
         rent_pull_authorized_amount: None,
         last_rent_pull_timestamp: None,
         billing_cycle_duration: 2_592_000,
-        yield_delegation_enabled: false,
         yield_accumulated: 0,
         equity_balance: 0,
         equity_percentage_bps: 0,
-        had_late_payment: false,
-        has_pet: false,
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
+        flags: crate::lease_flags::ACTIVE,
         early_termination_fee_bps,
         fixed_penalty,
     }
@@ -320,7 +315,7 @@ fn test_early_termination_inactive_lease_fails() {
         None,
     );
     lease.status = LeaseStatus::Expired;
-    lease.active = false;
+    lease.flags &= !crate::lease_flags::ACTIVE;
     seed_lease(&env, &id, LEASE_ID, &lease);
 
     // Try early termination on inactive lease
@@ -412,9 +407,9 @@ fn test_create_lease_instance_with_early_termination_fees() {
         late_fee_flat: 0,
         late_fee_per_sec: 0,
         equity_percentage_bps: 0,
-        has_pet: false,
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
+        has_pet: false,
         yield_delegation_enabled: false,
         deposit_asset: None,
         dex_contract: None,
@@ -458,9 +453,9 @@ fn test_create_lease_instance_with_fixed_penalty() {
         late_fee_flat: 0,
         late_fee_per_sec: 0,
         equity_percentage_bps: 0,
-        has_pet: false,
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
+        has_pet: false,
         yield_delegation_enabled: false,
         deposit_asset: None,
         dex_contract: None,

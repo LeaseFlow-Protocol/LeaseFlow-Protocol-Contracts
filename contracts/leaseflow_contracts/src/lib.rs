@@ -189,38 +189,45 @@ pub struct Lease {
     pub payment_token: Address,
 }
 
+/// Bitmask flags for `LeaseInstance`.
+///
+/// Bit layout (LSB = bit 0):
+/// ```text
+/// bit 0 – active
+/// bit 1 – flat_fee_applied
+/// bit 2 – had_late_payment
+/// bit 3 – has_pet
+/// bit 4 – yield_delegation_enabled
+/// bit 5 – paused
+/// ```
+pub mod lease_flags {
+    pub const ACTIVE: u8                  = 1 << 0;
+    pub const FLAT_FEE_APPLIED: u8        = 1 << 1;
+    pub const HAD_LATE_PAYMENT: u8        = 1 << 2;
+    pub const HAS_PET: u8                 = 1 << 3;
+    pub const YIELD_DELEGATION_ENABLED: u8 = 1 << 4;
+    pub const PAUSED: u8                  = 1 << 5;
+}
+
+/// Fields ordered largest → smallest to minimise Soroban persistent-storage
+/// serialisation padding and reduce on-chain rent costs.
+///
+/// Boolean state is packed into the `flags` bitmask; use the `lease_flags`
+/// constants together with `flags & MASK != 0` / `flags |= MASK` /
+/// `flags &= !MASK` for reads and writes.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeaseInstance {
-    pub landlord: Address,
-    pub tenant: Address,
+    // --- i128 fields (16 bytes each) ---
     pub rent_amount: i128,
     pub deposit_amount: i128,
     pub security_deposit: i128,
-    pub start_date: u64,
-    pub end_date: u64,
-    pub property_uri: String,
-    pub status: LeaseStatus,
-    pub nft_contract: Option<Address>,
-    pub token_id: Option<u128>,
-    pub active: bool,
     pub rent_paid: i128,
-    pub expiry_time: u64,
-    pub buyout_price: Option<i128>,
     pub cumulative_payments: i128,
     pub debt: i128,
-    pub rent_paid_through: u64,
-    pub deposit_status: DepositStatus,
-    pub rent_per_sec: i128,
-    pub grace_period_end: u64,
     pub late_fee_flat: i128,
     pub late_fee_per_sec: i128,
-    pub flat_fee_applied: bool,
-    pub seconds_late_charged: u64,
-    pub withdrawal_address: Option<Address>,
     pub rent_withdrawn: i128,
-    pub arbitrators: soroban_sdk::Vec<Address>,
-    pub maintenance_status: MaintenanceStatus,
     pub withheld_rent: i128,
     pub repair_proof_hash: Option<BytesN<32>>,
     pub inspector: Option<Address>,
@@ -237,12 +244,46 @@ pub struct LeaseInstance {
     pub yield_delegation_enabled: bool,
     pub yield_accumulated: i128,
     pub equity_balance: i128,
-    pub equity_percentage_bps: u32,
-    pub had_late_payment: bool,
-    pub has_pet: bool,
     pub pet_deposit_amount: i128,
     pub pet_rent_amount: i128,
+    pub rent_per_sec: i128,
+    pub buyout_price: Option<i128>,
+    pub rent_pull_authorized_amount: Option<i128>,
+    // --- Address / complex fields ---
+    pub landlord: Address,
+    pub tenant: Address,
     pub payment_token: Address,
+    pub withdrawal_address: Option<Address>,
+    pub inspector: Option<Address>,
+    pub pause_initiator: Option<Address>,
+    pub nft_contract: Option<Address>,
+    pub arbitrators: soroban_sdk::Vec<Address>,
+    // --- u64 fields (8 bytes each) ---
+    pub start_date: u64,
+    pub end_date: u64,
+    pub expiry_time: u64,
+    pub rent_paid_through: u64,
+    pub grace_period_end: u64,
+    pub seconds_late_charged: u64,
+    pub total_paused_duration: u64,
+    pub billing_cycle_duration: u64,
+    pub paused_at: Option<u64>,
+    pub last_rent_pull_timestamp: Option<u64>,
+    pub token_id: Option<u128>,
+    // --- u32 fields (4 bytes each) ---
+    pub equity_percentage_bps: u32,
+    // --- enum / small fields ---
+    pub status: LeaseStatus,
+    pub deposit_status: DepositStatus,
+    pub maintenance_status: MaintenanceStatus,
+    pub repair_proof_hash: Option<BytesN<32>>,
+    pub pause_reason: Option<String>,
+    pub property_uri: String,
+    /// Packed boolean flags – use `lease_flags::*` constants.
+    pub flags: u8,
+    // --- early termination fields ---
+    pub early_termination_fee_bps: Option<u32>,
+    pub fixed_penalty: Option<i128>,
     // Issue #127: Webhook-compatible reference ID for Web2 backend correlation
     pub lessor_reference_id: Option<String>,
 }
@@ -341,6 +382,8 @@ pub enum DataKey {
     VotingPowerSnapshot(u64, Address),
     // Issue #124: Active Leases Index
     ActiveLeasesIndex,
+    // Issue #135: Reentrancy guard
+    NonReentrant,
     // Issue #125: Historical Leases Index for cursor-based pagination
     HistoricalLeasesIndex,
 }
@@ -969,6 +1012,40 @@ pub struct LeaseContract;
 
 #[contractimpl]
 impl LeaseContract {
+    /// Acquire the reentrancy lock. Panics if already locked (nested call detected).
+    ///
+    /// Uses Soroban **Temporary** storage so the lock is automatically cleared
+    /// at the end of the transaction, guaranteeing it resets on both success
+    /// and failure paths without extra cleanup code.
+    fn acquire_reentrancy_lock(env: &Env) {
+        let locked: bool = env
+            .storage()
+            .temporary()
+            .get(&DataKey::NonReentrant)
+            .unwrap_or(false);
+        if locked {
+            // Emit detection event before panicking so off-chain monitors can alert.
+            env.events().publish(
+                (symbol_short!("REENTRY"), symbol_short!("DETECT")),
+                env.ledger().timestamp(),
+            );
+            panic!("ReentrancyAttemptDetected");
+        }
+        // TTL of 1 ledger is sufficient – the lock only needs to survive the
+        // current transaction.
+        env.storage()
+            .temporary()
+            .set(&DataKey::NonReentrant, &true);
+        env.storage()
+            .temporary()
+            .extend_ttl(&DataKey::NonReentrant, 1, 1);
+    }
+
+    /// Release the reentrancy lock after all external calls have completed.
+    fn release_reentrancy_lock(env: &Env) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::NonReentrant);
     pub fn initialize(env: Env, admin: Address) {
         env.storage()
             .instance()
@@ -1638,11 +1715,14 @@ impl LeaseContract {
         landlord: Address,
         params: CreateLeaseParams,
     ) -> Result<(), LeaseError> {
+        // Issue #135: Reentrancy guard – protects the DEX swap path.
+        Self::acquire_reentrancy_lock(&env);
         if env
             .storage()
             .persistent()
             .has(&DataKey::LeaseInstance(lease_id))
         {
+            Self::release_reentrancy_lock(&env);
             return Err(LeaseError::LeaseAlreadyExists);
         }
         landlord.require_auth();
@@ -1658,7 +1738,7 @@ impl LeaseContract {
         };
 
         let locked_amount = if let Some(deposit_asset) = params.deposit_asset.clone() {
-            Self::execute_deposit_swap(
+            let result = Self::execute_deposit_swap(
                 &env,
                 lease_id,
                 &params.tenant,
@@ -1668,10 +1748,25 @@ impl LeaseContract {
                 params.max_slippage_bps,
                 &params.swap_path,
                 &params.dex_contract,
-            )?
+            );
+            match result {
+                Ok(v) => v,
+                Err(e) => {
+                    Self::release_reentrancy_lock(&env);
+                    return Err(e);
+                }
+            }
         } else {
             params.security_deposit
         };
+        // Build initial flags bitmask (Issue #128).
+        let mut init_flags: u8 = lease_flags::ACTIVE; // active = true
+        if params.yield_delegation_enabled {
+            init_flags |= lease_flags::YIELD_DELEGATION_ENABLED;
+        }
+        if params.has_pet {
+            init_flags |= lease_flags::HAS_PET;
+        }
         let lease = LeaseInstance {
             landlord,
             tenant: params.tenant,
@@ -1686,7 +1781,6 @@ impl LeaseContract {
             property_uri: params.property_uri.clone(),
             nft_contract: None,
             token_id: None,
-            active: true,
             debt: 0,
             rent_paid: 0,
             expiry_time: params.end_date,
@@ -1696,7 +1790,6 @@ impl LeaseContract {
             grace_period_end: params.grace_period_end,
             late_fee_flat: params.late_fee_flat,
             late_fee_per_sec: params.late_fee_per_sec,
-            flat_fee_applied: false,
             seconds_late_charged: 0,
             withdrawal_address: None,
             rent_withdrawn: 0,
@@ -1705,7 +1798,6 @@ impl LeaseContract {
             withheld_rent: 0,
             repair_proof_hash: None,
             inspector: None,
-            paused: false,
             pause_reason: None,
             paused_at: None,
             pause_initiator: None,
@@ -1713,25 +1805,31 @@ impl LeaseContract {
             rent_pull_authorized_amount: None,
             last_rent_pull_timestamp: None,
             billing_cycle_duration: 2_592_000,
-            yield_delegation_enabled: params.yield_delegation_enabled,
             yield_accumulated: 0,
             equity_balance: 0,
             equity_percentage_bps: params.equity_percentage_bps,
-            had_late_payment: false,
-            has_pet: params.has_pet,
             pet_deposit_amount: params.pet_deposit_amount,
             pet_rent_amount: params.pet_rent_amount,
             payment_token: params.payment_token.clone(),
+            flags: init_flags,
+            early_termination_fee_bps: None,
+            fixed_penalty: None,
             lessor_reference_id: params.lessor_reference_id,
         };
         save_lease_instance(&env, lease_id, &lease);
 
         // Add to active leases index for optimized querying (Issue #124)
-        Self::add_to_active_leases_index(&env, lease_id)?;
-
+        let idx_result = Self::add_to_active_leases_index(&env, lease_id);
         // Initialize velocity tracker for landlord and update portfolio size
-        VelocityGuard::initialize_lessor(&env, &landlord)?;
-        VelocityGuard::update_portfolio_size(&env, &landlord, 1)?;
+        let vel_init = VelocityGuard::initialize_lessor(&env, &landlord);
+        let vel_port = VelocityGuard::update_portfolio_size(&env, &landlord, 1);
+
+        // Release reentrancy lock before propagating any errors (Issue #135).
+        Self::release_reentrancy_lock(&env);
+
+        idx_result?;
+        vel_init?;
+        vel_port?;
 
         LeaseSigned {
             lease_id,
@@ -1793,7 +1891,7 @@ impl LeaseContract {
 
         let mut lease =
             load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
-        require!(lease.active, "Lease is not active");
+        require!(lease.flags & lease_flags::ACTIVE != 0, "Lease is not active");
 
         let is_primary = payer == lease.tenant;
         let is_authorized = env
@@ -1838,7 +1936,7 @@ impl LeaseContract {
 
         if let Some(buyout_price) = lease.buyout_price {
             if lease.cumulative_payments >= buyout_price {
-                lease.active = false;
+                lease.flags &= !lease_flags::ACTIVE;
                 lease.status = LeaseStatus::Terminated;
                 if let (Some(nft), Some(id)) = (&lease.nft_contract, &lease.token_id) {
                     let client = nft_contract::NftClient::new(&env, nft);
@@ -2081,7 +2179,7 @@ impl LeaseContract {
         // Update lease status
         lease.status = LeaseStatus::Terminated;
         lease.deposit_status = DepositStatus::Settled;
-        lease.active = false;
+        lease.flags &= !lease_flags::ACTIVE;
 
         // Handle NFT if present
         if let (Some(nft_contract), Some(token_id)) = 
@@ -2270,7 +2368,7 @@ impl LeaseContract {
         }
 
         lease.status = LeaseStatus::Terminated;
-        lease.active = false;
+        lease.flags &= !lease_flags::ACTIVE;
 
         save_lease_instance(&env, lease_id, &lease);
 
@@ -2450,7 +2548,7 @@ impl LeaseContract {
 
         lease.status = LeaseStatus::Terminated;
         lease.deposit_status = DepositStatus::Settled;
-        lease.active = false;
+        lease.flags &= !lease_flags::ACTIVE;
 
         if let (Some(nft_contract_addr), Some(token_id)) =
             (lease.nft_contract.clone(), lease.token_id)
@@ -2535,9 +2633,9 @@ impl LeaseContract {
         if current_time > lease.grace_period_end {
             let seconds_late = current_time - lease.grace_period_end;
 
-            if !lease.flat_fee_applied {
+            if lease.flags & lease_flags::FLAT_FEE_APPLIED == 0 {
                 lease.debt += lease.late_fee_flat;
-                lease.flat_fee_applied = true;
+                lease.flags |= lease_flags::FLAT_FEE_APPLIED;
             }
 
             if seconds_late > lease.seconds_late_charged {
@@ -2958,6 +3056,14 @@ impl LeaseContract {
     }
 
     pub fn execute_deposit_slash(env: Env, payload: OraclePayload) -> Result<(), LeaseError> {
+        // Issue #135: Reentrancy guard – protects oracle-triggered token transfers.
+        Self::acquire_reentrancy_lock(&env);
+        let result = Self::execute_deposit_slash_inner(&env, payload);
+        Self::release_reentrancy_lock(&env);
+        result
+    }
+
+    fn execute_deposit_slash_inner(env: &Env, payload: OraclePayload) -> Result<(), LeaseError> {
         let current_time = env.ledger().timestamp();
         
         // First, check staleness
@@ -3149,7 +3255,7 @@ impl LeaseContract {
         }
 
         lease.deposit_status = DepositStatus::Settled;
-        lease.active = false;
+        lease.flags &= !lease_flags::ACTIVE;
         save_lease_instance(&env, payload.lease_id, &lease);
 
         // Record deposit slash for velocity tracking
@@ -3869,6 +3975,50 @@ impl LeaseContract {
     // Issue #127: Set lessor_reference_id on an existing lease
     // ========================================================================
 
+    pub fn get_active_leases(env: Env) -> soroban_sdk::Vec<ActiveLeaseSummary> {
+        // This is a read-only function - no state mutations
+        // Returns comprehensive lease data for frontend rendering
+
+        let mut active_leases = soroban_sdk::Vec::new(&env);
+
+        // Iterate through lease instances (in production, this would use an index)
+        // For optimization, we maintain an ActiveLeasesIndex
+        let lease_ids: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveLeasesIndex)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        for lease_id in lease_ids.iter() {
+            if let Ok(lease) = Self::get_lease_instance(env.clone(), lease_id) {
+                // Only return active leases
+                if lease.flags & lease_flags::ACTIVE != 0
+                    && (lease.status == LeaseStatus::Active
+                        || lease.status == LeaseStatus::Pending)
+                {
+                    let summary = ActiveLeaseSummary {
+                        lease_id,
+                        landlord: lease.landlord,
+                        tenant: lease.tenant,
+                        rent_amount: lease.rent_amount,
+                        rent_per_sec: lease.rent_per_sec,
+                        deposit_amount: lease.deposit_amount,
+                        security_deposit: lease.security_deposit,
+                        start_date: lease.start_date,
+                        end_date: lease.end_date,
+                        property_uri: lease.property_uri,
+                        status: lease.status,
+                        payment_token: lease.payment_token,
+                        rent_paid: lease.rent_paid,
+                        cumulative_payments: lease.cumulative_payments,
+                        debt: lease.debt,
+                        active: lease.flags & lease_flags::ACTIVE != 0,
+                        yield_delegation_enabled: lease.flags & lease_flags::YIELD_DELEGATION_ENABLED != 0,
+                        equity_percentage_bps: lease.equity_percentage_bps,
+                    };
+                    active_leases.push_back(summary);
+                }
+            }
     /// Allows the landlord to attach (or update) the Web2 reference ID after
     /// lease creation.  The value is sanitised to ASCII printable characters
     /// only to prevent injection attacks in downstream Web2 systems.

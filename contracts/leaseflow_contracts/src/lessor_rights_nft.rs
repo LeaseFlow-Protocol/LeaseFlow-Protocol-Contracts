@@ -733,7 +733,6 @@ mod tests {
             // ... other fields with default values
             nft_contract: None,
             token_id: None,
-            active: true,
             rent_paid: 0,
             expiry_time: env.ledger().timestamp() + (30 * 24 * 60 * 60),
             buyout_price: None,
@@ -745,7 +744,6 @@ mod tests {
             grace_period_end: env.ledger().timestamp() + (30 * 24 * 60 * 60),
             late_fee_flat: 0,
             late_fee_per_sec: 0,
-            flat_fee_applied: false,
             seconds_late_charged: 0,
             withdrawal_address: None,
             rent_withdrawn: 0,
@@ -754,7 +752,6 @@ mod tests {
             withheld_rent: 0,
             repair_proof_hash: None,
             inspector: None,
-            paused: false,
             pause_reason: None,
             paused_at: None,
             pause_initiator: None,
@@ -762,15 +759,15 @@ mod tests {
             rent_pull_authorized_amount: None,
             last_rent_pull_timestamp: None,
             billing_cycle_duration: 30 * 24 * 60 * 60,
-            yield_delegation_enabled: false,
             yield_accumulated: 0,
             equity_balance: 0,
             equity_percentage_bps: 0,
-            had_late_payment: false,
-            has_pet: false,
             pet_deposit_amount: 0,
             pet_rent_amount: 0,
             last_tenant_interaction: env.ledger().timestamp(),
+        flags: crate::lease_flags::ACTIVE,
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
         };
         
         // Store lease
