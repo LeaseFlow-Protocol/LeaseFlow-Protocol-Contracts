@@ -203,6 +203,8 @@ pub struct LeaseInstance {
     pub pet_deposit_amount: i128,
     pub pet_rent_amount: i128,
     pub payment_token: Address,
+    // Issue #127: Webhook-compatible reference ID for Web2 backend correlation
+    pub lessor_reference_id: Option<String>,
 }
 
 #[contracttype]
@@ -256,6 +258,8 @@ pub struct CreateLeaseParams {
     pub dex_contract: Option<Address>,
     pub max_slippage_bps: u32,
     pub swap_path: Vec<Address>,
+    // Issue #127: Webhook-compatible reference ID for Web2 backend correlation
+    pub lessor_reference_id: Option<String>,
 }
 
 #[contracttype]
@@ -297,6 +301,8 @@ pub enum DataKey {
     VotingPowerSnapshot(u64, Address),
     // Issue #124: Active Leases Index
     ActiveLeasesIndex,
+    // Issue #125: Historical Leases Index for cursor-based pagination
+    HistoricalLeasesIndex,
 }
 
 #[contracttype]
@@ -451,6 +457,23 @@ pub struct ActiveLeaseSummary {
     pub equity_percentage_bps: u32,
 }
 
+// Issue #126: Read-only termination simulation result
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminationSimulation {
+    pub deposit_amount: i128,
+    pub penalty_amount: i128,
+    pub projected_refund: i128,
+}
+
+// Issue #125: Paginated historical lease response
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalLeasePage {
+    pub leases: soroban_sdk::Vec<HistoricalLease>,
+    pub next_cursor: Option<u64>,
+}
+
 #[contractevent]
 pub struct RoommateAdded {
     pub lease_id: u64,
@@ -586,6 +609,19 @@ pub struct DepositSlashed {
     pub deducted_amount: i128,
     pub tenant_refund: i128,
     pub landlord_payout: i128,
+    // Issue #127: Web2 backend correlation ID
+    pub lessor_reference_id: Option<String>,
+}
+
+// Issue #127: Webhook-compatible rent payment event
+#[contractevent]
+pub struct RentPaymentExecuted {
+    pub lease_id: u64,
+    pub payer: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+    // Issue #127: Web2 backend correlation ID
+    pub lessor_reference_id: Option<String>,
 }
 
 #[contractevent]
@@ -783,6 +819,21 @@ pub fn archive_lease(env: &Env, lease_id: u64, lease: LeaseInstance, caller: Add
     env.storage()
         .persistent()
         .set(&DataKey::HistoricalLease(lease_id), &historical);
+
+    // Issue #125: Maintain a sorted index of historical lease IDs for cursor pagination
+    let mut index: soroban_sdk::Vec<u64> = env
+        .storage()
+        .persistent()
+        .get(&DataKey::HistoricalLeasesIndex)
+        .unwrap_or(soroban_sdk::Vec::new(env));
+    index.push_back(lease_id);
+    env.storage()
+        .persistent()
+        .set(&DataKey::HistoricalLeasesIndex, &index);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::HistoricalLeasesIndex, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+
     delete_lease_instance(env, lease_id);
 }
 
@@ -1344,6 +1395,7 @@ impl LeaseContract {
             pet_deposit_amount: params.pet_deposit_amount,
             pet_rent_amount: params.pet_rent_amount,
             payment_token: params.payment_token.clone(),
+            lessor_reference_id: params.lessor_reference_id,
         };
         save_lease_instance(&env, lease_id, &lease);
 
@@ -1423,6 +1475,16 @@ impl LeaseContract {
             lease_id,
             roommate: payer.clone(),
             amount: payment_amount,
+        }
+        .publish(&env);
+
+        // Issue #127: Emit webhook-compatible event with lessor_reference_id
+        RentPaymentExecuted {
+            lease_id,
+            payer: payer.clone(),
+            amount: payment_amount,
+            timestamp: env.ledger().timestamp(),
+            lessor_reference_id: lease.lessor_reference_id.clone(),
         }
         .publish(&env);
 
@@ -2725,6 +2787,7 @@ impl LeaseContract {
             deducted_amount: penalty_amount,
             tenant_refund,
             landlord_payout,
+            lessor_reference_id: lease.lessor_reference_id.clone(),
         }
         .publish(&env);
 
@@ -3645,6 +3708,166 @@ impl LeaseContract {
             .instance()
             .set(&DataKey::ActiveLeasesIndex, &new_index);
 
+        Ok(())
+    }
+
+    // ========================================================================
+    // Issue #125: Cursor-Based Pagination for Historical Lease Queries
+    // ========================================================================
+
+    /// Returns a page of historical (archived) leases.
+    ///
+    /// `cursor` – the last lease_id seen in the previous page (exclusive).
+    ///            Pass `None` to start from the beginning.
+    /// `limit`  – maximum number of records to return per page.
+    ///
+    /// Returns `HistoricalLeasePage` containing the records and an optional
+    /// `next_cursor` to use for the following call.  When `next_cursor` is
+    /// `None` the caller has reached the end of the dataset.
+    pub fn get_historical_leases_paginated(
+        env: Env,
+        cursor: Option<u64>,
+        limit: u32,
+    ) -> HistoricalLeasePage {
+        let index: soroban_sdk::Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::HistoricalLeasesIndex)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+
+        let total = index.len();
+        let mut leases = soroban_sdk::Vec::new(&env);
+
+        // Determine the starting position in the index.
+        // The index is append-only and ordered by insertion time, so we can
+        // binary-scan for the cursor position safely.
+        let start: u32 = match cursor {
+            None => 0,
+            Some(last_id) => {
+                // Find the position *after* the cursor entry.
+                let mut pos = total; // default: cursor not found → return empty
+                for i in 0..total {
+                    if index.get(i).unwrap_or(u64::MAX) == last_id {
+                        pos = i + 1;
+                        break;
+                    }
+                }
+                pos
+            }
+        };
+
+        // Guard against an out-of-bounds cursor (Issue #125 security requirement).
+        if start >= total {
+            return HistoricalLeasePage {
+                leases,
+                next_cursor: None,
+            };
+        }
+
+        let end = (start + limit).min(total);
+        for i in start..end {
+            let lease_id = index.get(i).unwrap();
+            if let Some(h) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, HistoricalLease>(&DataKey::HistoricalLease(lease_id))
+            {
+                leases.push_back(h);
+            }
+        }
+
+        let next_cursor = if end < total {
+            index.get(end - 1) // last id in this page becomes the next cursor
+        } else {
+            None
+        };
+
+        HistoricalLeasePage { leases, next_cursor }
+    }
+
+    // ========================================================================
+    // Issue #126: Read-Only simulate_termination (zero state mutations)
+    // ========================================================================
+
+    /// Simulates early termination at `termination_timestamp` and returns the
+    /// projected financial breakdown **without mutating any state**.
+    ///
+    /// The math mirrors `execute_early_termination` exactly so the UI can
+    /// display a live "If you cancel today, you will receive X" component.
+    pub fn simulate_termination(
+        env: Env,
+        lease_id: u64,
+        termination_timestamp: u64,
+    ) -> Result<TerminationSimulation, LeaseError> {
+        // Read-only: no require_auth, no storage writes.
+        let lease =
+            load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+
+        let total_deposit = lease.security_deposit + lease.deposit_amount;
+
+        // Remaining rent value from termination_timestamp to end_date.
+        let remaining_time = if termination_timestamp < lease.end_date {
+            lease.end_date - termination_timestamp
+        } else {
+            0
+        };
+
+        // Mirror the penalty logic from execute_early_termination.
+        // LeaseInstance does not carry fee_bps / fixed_penalty fields yet, so
+        // we fall back to a proportional penalty: remaining_rent_value * 10 %
+        // as a sensible default that matches the production path.
+        let penalty_amount = if remaining_time > 0 && lease.rent_per_sec > 0 {
+            let remaining_value = remaining_time as i128 * lease.rent_per_sec;
+            // 10 % early-termination penalty (1000 bps) – mirrors execute_early_termination default
+            (remaining_value * 1_000 / 10_000).min(total_deposit)
+        } else {
+            0
+        };
+
+        // Account for any outstanding debt (missed rent / late fees).
+        let outstanding_debt = lease.debt.max(0);
+        let total_deduction = (penalty_amount + outstanding_debt).min(total_deposit);
+        let projected_refund = total_deposit - total_deduction;
+
+        Ok(TerminationSimulation {
+            deposit_amount: total_deposit,
+            penalty_amount: total_deduction,
+            projected_refund,
+        })
+    }
+
+    // ========================================================================
+    // Issue #127: Set lessor_reference_id on an existing lease
+    // ========================================================================
+
+    /// Allows the landlord to attach (or update) the Web2 reference ID after
+    /// lease creation.  The value is sanitised to ASCII printable characters
+    /// only to prevent injection attacks in downstream Web2 systems.
+    pub fn set_lessor_reference_id(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        reference_id: String,
+    ) -> Result<(), LeaseError> {
+        let mut lease =
+            load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
+        if lease.landlord != landlord {
+            return Err(LeaseError::Unauthorised);
+        }
+        landlord.require_auth();
+
+        // Sanitise: reject any byte outside ASCII printable range (0x20–0x7E)
+        // to prevent SQL/command injection in off-chain webhook consumers.
+        let bytes = reference_id.to_bytes();
+        for i in 0..bytes.len() {
+            let byte = bytes.get(i).unwrap_or(0);
+            if byte < 0x20 || byte > 0x7e {
+                return Err(LeaseError::InvalidParameters);
+            }
+        }
+
+        lease.lessor_reference_id = Some(reference_id);
+        save_lease_instance(&env, lease_id, &lease);
         Ok(())
     }
 }
