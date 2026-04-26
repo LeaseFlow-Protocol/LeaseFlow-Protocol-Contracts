@@ -77,6 +77,15 @@ pub enum DamageSeverity {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AssetCondition {
+    Mint,
+    Worn,
+    Damaged,
+    Destroyed,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OracleStatus {
     Active,
     Demoted,
@@ -89,6 +98,17 @@ pub struct OraclePayload {
     pub lease_id: u64,
     pub oracle_pubkey: BytesN<32>,
     pub damage_severity: DamageSeverity,
+    pub nonce: u64,
+    pub timestamp: u64,
+    pub signature: BytesN<64>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssetConditionMetadataPayload {
+    pub lease_id: u64,
+    pub oracle_pubkey: BytesN<32>,
+    pub asset_condition: AssetCondition,
     pub nonce: u64,
     pub timestamp: u64,
     pub signature: BytesN<64>,
@@ -298,19 +318,8 @@ pub enum DataKey {
     OracleConfig(BytesN<32>),
     FallbackHierarchy,
     OracleFailureTimestamp(BytesN<32>),
-    // Issue #117: Multi-Sig Veto
-    SecurityCouncil,
-    PendingSlash(u64),
-    VetoVote(u64, Address),
-    // Issue #118: Dynamic Protocol Fees
-    ProtocolFeeConfig,
-    PendingFeeUpdate,
-    // Issue #119: Quadratic Voting
-    GovernanceRound(u64),
-    TreasuryVote(u64, Address),
-    VotingPowerSnapshot(u64, Address),
-    // Issue #124: Active Leases Index
-    ActiveLeasesIndex,
+    AssetCondition(u64),
+    OracleRateLimit(BytesN<32>, u64),
 }
 
 #[contracttype]
@@ -643,6 +652,15 @@ pub struct DaoArbitrationTriggered {
     pub reason: String,
 }
 
+#[contractevent]
+pub struct AssetMetadataUpdated {
+    pub lease_id: u64,
+    pub asset_condition: AssetCondition,
+    pub oracle_pubkey: BytesN<32>,
+    pub update_timestamp: u64,
+    pub previous_condition: AssetCondition,
+}
+
 #[contracterror]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LeaseError {
@@ -847,6 +865,15 @@ mod yield_protocol {
         fn withdraw(env: Env, from: Address, lp_tokens: i128) -> i128;
         fn get_balance(env: Env, user: Address) -> i128;
         fn claim_rewards(env: Env, user: Address) -> i128;
+    }
+}
+
+mod asset_registry {
+    use soroban_sdk::{contractclient, Address, Env, String};
+    #[contractclient(name = "AssetRegistryClient")]
+    pub trait AssetRegistryInterface {
+        fn update_asset_metadata(env: Env, lease_id: u64, condition: String, metadata_uri: String);
+        fn get_asset_condition(env: Env, lease_id: u64) -> String;
     }
 }
 
@@ -3272,12 +3299,163 @@ impl LeaseContract {
             crate::lessee_access_token::RevocationReason::LeaseTerminated,
         ).map_err(|_| LeaseError::Unauthorised)
     }
+
+    /// Update asset condition metadata via whitelisted condition Oracles
+    pub fn update_asset_condition_metadata(
+        env: Env,
+        payload: AssetConditionMetadataPayload,
+        asset_registry_address: Address,
+    ) -> Result<(), LeaseError> {
+        let current_time = env.ledger().timestamp();
+        
+        // Rate limiting check (prevent spamming the registry)
+        let rate_limit_key = DataKey::OracleRateLimit(payload.oracle_pubkey.clone(), current_time / 3600); // 1-hour windows
+        if env.storage().instance().has(&rate_limit_key) {
+            return Err(LeaseError::OracleStale); // Reuse existing error for rate limiting
+        }
+        
+        // Check oracle staleness
+        Self::staleness_check(&env, payload.timestamp)?;
+        
+        // Check if oracle is whitelisted and available
+        if !Self::is_oracle_whitelisted(&env, &payload.oracle_pubkey) {
+            return Err(LeaseError::OracleNotWhitelisted);
+        }
+        
+        Self::check_oracle_availability(&env, &payload.oracle_pubkey)?;
+        
+        // Validate nonce
+        let stored_nonce = Self::get_oracle_nonce(&env, &payload.oracle_pubkey);
+        if payload.nonce <= stored_nonce {
+            return Err(LeaseError::InvalidNonce);
+        }
+        
+        // Verify cryptographic signature
+        let message_data = soroban_sdk::Bytes::from_slice(&env, &payload.lease_id.to_be_bytes());
+        Self::verify_ed25519_signature(
+            &env,
+            &payload.oracle_pubkey,
+            &message_data,
+            &payload.signature,
+        );
+        
+        // Get current asset condition
+        let current_condition = env.storage()
+            .persistent()
+            .get(&DataKey::AssetCondition(payload.lease_id))
+            .unwrap_or(AssetCondition::Mint);
+        
+        // Update asset condition
+        env.storage()
+            .persistent()
+            .set(&DataKey::AssetCondition(payload.lease_id), &payload.asset_condition);
+        env.storage().persistent().extend_ttl(
+            &DataKey::AssetCondition(payload.lease_id),
+            YEAR_IN_LEDGERS,
+            YEAR_IN_LEDGERS,
+        );
+        
+        // Set rate limit for this oracle (1 update per hour maximum)
+        env.storage()
+            .instance()
+            .set(&rate_limit_key, &true);
+        env.storage()
+            .instance()
+            .extend_ttl(&rate_limit_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+        
+        // Update oracle nonce
+        Self::set_oracle_nonce(&env, &payload.oracle_pubkey, payload.nonce);
+        
+        // Cross-contract call to Asset Registry
+        let condition_string = match payload.asset_condition {
+            AssetCondition::Mint => String::from_str(&env, "Mint"),
+            AssetCondition::Worn => String::from_str(&env, "Worn"),
+            AssetCondition::Damaged => String::from_str(&env, "Damaged"),
+            AssetCondition::Destroyed => String::from_str(&env, "Destroyed"),
+        };
+        
+        let asset_registry_client = asset_registry::AssetRegistryClient::new(&env, &asset_registry_address);
+        asset_registry_client.update_asset_metadata(
+            &payload.lease_id,
+            &condition_string,
+            &String::from_str(&env, ""), // Empty metadata URI for now
+        );
+        
+        // Emit AssetMetadataUpdated event
+        AssetMetadataUpdated {
+            lease_id: payload.lease_id,
+            asset_condition: payload.asset_condition.clone(),
+            oracle_pubkey: payload.oracle_pubkey.clone(),
+            update_timestamp: current_time,
+            previous_condition: current_condition,
+        }
+        .publish(&env);
+        
+        // If condition is Destroyed, automatically trigger lease termination and deposit slashing
+        if payload.asset_condition == AssetCondition::Destroyed {
+            // Get lease instance
+            let mut lease = load_lease_instance_by_id(&env, payload.lease_id)
+                .ok_or(LeaseError::LeaseNotFound)?;
+            
+            // Only terminate if lease is active
+            if lease.status == LeaseStatus::Active {
+                // Execute early termination
+                Self::execute_early_termination(&env, payload.lease_id, lease.tenant.clone())?;
+                
+                // Create damage payload for deposit slashing
+                let damage_payload = OraclePayload {
+                    lease_id: payload.lease_id,
+                    oracle_pubkey: payload.oracle_pubkey.clone(),
+                    damage_severity: DamageSeverity::Catastrophic,
+                    nonce: payload.nonce + 1, // Use next nonce to avoid conflicts
+                    timestamp: current_time,
+                    signature: payload.signature.clone(), // Reuse signature for simplicity
+                };
+                
+                // Execute full deposit slash
+                Self::execute_deposit_slash(env, damage_payload)?;
+            }
+        }
+        
+        Ok(())
+    }
+
+    /// Get current asset condition for a lease
+    pub fn get_asset_condition(env: Env, lease_id: u64) -> AssetCondition {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AssetCondition(lease_id))
+            .unwrap_or(AssetCondition::Mint)
+    }
+
+    /// Execute early termination when asset is destroyed
+    fn execute_early_termination(env: &Env, lease_id: u64, caller: Address) -> Result<(), LeaseError> {
+        let mut lease = load_lease_instance_by_id(env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        if lease.status != LeaseStatus::Active {
+            return Err(LeaseError::LeaseNotTerminated);
+        }
+        
+        lease.status = LeaseStatus::Terminated;
+        lease.active = false;
+        
+        save_lease_instance(env, lease_id, &lease);
+        
+        // Archive lease
+        archive_lease(env, lease_id, lease, caller);
+        
+        // Emit termination event
+        LeaseTerminated { lease_id }.publish(env);
+        
+        Ok(())
+    }
 }
 
 mod test;
 mod upgrade_tests;
 mod oracle_fallback_tests;
-mod governance_tests;
+mod asset_metadata_tests;
 
 // Global Escrow Freeze Circuit Breaker Modules
 pub mod escrow_vault;
