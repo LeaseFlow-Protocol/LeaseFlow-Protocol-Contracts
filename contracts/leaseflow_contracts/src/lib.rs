@@ -16,8 +16,17 @@ use velocity_guard::VelocityGuard;
 mod continuous_billing_module;
 use continuous_billing_module::ContinuousBillingModule;
 
+mod lessee_access_token;
+use lessee_access_token::LesseeAccessTokenManager;
+
+mod derived_access_token;
+use derived_access_token::DerivedAccessTokenManager;
+
 #[cfg(test)]
 mod velocity_guard_tests;
+
+#[cfg(test)]
+mod derived_access_token_tests;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1653,6 +1662,23 @@ impl LeaseContract {
             }
         }
 
+        // Cascade burn all derived tokens before archiving
+        if let Some(access_token_id) = lease.token_id {
+            // Burn all derived tokens in the hierarchy
+            let _ = DerivedAccessTokenManager::recursive_burn_hierarchy(
+                env.clone(),
+                access_token_id,
+                crate::lessee_access_token::RevocationReason::LeaseTerminated,
+            );
+            
+            // Revoke the root access token
+            let _ = LesseeAccessTokenManager::revoke_access_token(
+                env.clone(),
+                lease_id,
+                crate::lessee_access_token::RevocationReason::LeaseTerminated,
+            );
+        }
+
         archive_lease(&env, lease_id, lease, caller);
         LeaseTerminated { lease_id }.publish(&env);
         Ok(())
@@ -3168,633 +3194,83 @@ impl LeaseContract {
             .unwrap_or(0)
     }
 
-    // ========================================================================
-    // Issue #117: Multi-Sig Veto on Massive Deposit Slashing
-    // ========================================================================
-
-    pub fn initialize_security_council(
+    // Derived Access Token Management Functions
+    
+    /// Mint a derived access token for sub-lessee
+    pub fn mint_derived_access_token(
         env: Env,
-        admin: Address,
-        members: soroban_sdk::Vec<SecurityCouncilMember>,
-        veto_threshold_bps: u32,
-    ) -> Result<(), LeaseError> {
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(LeaseError::Unauthorised)?;
-        if admin != stored_admin {
-            return Err(LeaseError::Unauthorised);
-        }
-        admin.require_auth();
-
-        let mut total_voting_power: u32 = 0;
-        for member in members.iter() {
-            total_voting_power += member.voting_power;
-        }
-
-        let council = SecurityCouncil {
-            members,
-            veto_threshold_bps,
-            total_voting_power,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::SecurityCouncil, &council);
-
-        Ok(())
+        request: crate::derived_access_token::DerivedTokenRequest,
+    ) -> Result<u128, LeaseError> {
+        DerivedAccessTokenManager::mint_derived_access_token(env, request)
+            .map_err(|_| LeaseError::Unauthorised)
     }
 
-    pub fn add_council_member(
+    /// Transfer a derived access token
+    pub fn transfer_derived_access_token(
         env: Env,
-        admin: Address,
-        member: SecurityCouncilMember,
+        token_id: u128,
+        from_sublessee: Address,
+        to_sublessee: Address,
+        transfer_reason: String,
     ) -> Result<(), LeaseError> {
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(LeaseError::Unauthorised)?;
-        if admin != stored_admin {
-            return Err(LeaseError::Unauthorised);
-        }
-        admin.require_auth();
-
-        let mut council: SecurityCouncil = env
-            .storage()
-            .instance()
-            .get(&DataKey::SecurityCouncil)
-            .ok_or(LeaseError::Unauthorized)?;
-
-        let mut members = council.members;
-        members.push_back(member);
-        council.members = members;
-        council.total_voting_power += member.voting_power;
-
-        env.storage()
-            .instance()
-            .set(&DataKey::SecurityCouncil, &council);
-
-        Ok(())
+        DerivedAccessTokenManager::transfer_derived_token(env, token_id, from_sublessee, to_sublessee, transfer_reason)
+            .map_err(|_| LeaseError::Unauthorised)
     }
 
-    pub fn veto_slash_vote(
+    /// Update spatial zone for derived token
+    pub fn update_derived_token_spatial_zone(
         env: Env,
-        council_member: Address,
+        token_id: u128,
+        new_zone: crate::derived_access_token::SpatialZone,
+    ) -> Result<(), LeaseError> {
+        DerivedAccessTokenManager::update_spatial_zone(env, token_id, new_zone)
+            .map_err(|_| LeaseError::Unauthorised)
+    }
+
+    /// Get derived access token by ID
+    pub fn get_derived_access_token(
+        env: Env,
+        token_id: u128,
+    ) -> Result<crate::derived_access_token::DerivedAccessToken, LeaseError> {
+        DerivedAccessTokenManager::get_derived_token(env, token_id)
+            .map_err(|_| LeaseError::Unauthorised)
+    }
+
+    /// Get all derived tokens for a lease
+    pub fn get_lease_derived_tokens(env: Env, lease_id: u64) -> Vec<u128> {
+        DerivedAccessTokenManager::get_lease_derived_tokens(env, lease_id)
+    }
+
+    /// Get all derived tokens for a sublessee
+    pub fn get_sublessee_derived_tokens(env: Env, sublessee: Address) -> Vec<u128> {
+        DerivedAccessTokenManager::get_sublessee_derived_tokens(env, sublessee)
+    }
+
+    /// Get hierarchy metrics for a lease
+    pub fn get_derived_token_hierarchy_metrics(
+        env: Env,
         lease_id: u64,
-        vote_for_veto: bool,
-    ) -> Result<(), LeaseError> {
-        // Verify caller is a council member
-        let council: SecurityCouncil = env
-            .storage()
-            .instance()
-            .get(&DataKey::SecurityCouncil)
-            .ok_or(LeaseError::Unauthorized)?;
-
-        let mut member_voting_power: u32 = 0;
-        let mut is_member = false;
-
-        for member in council.members.iter() {
-            if member.address == council_member && member.active {
-                member_voting_power = member.voting_power;
-                is_member = true;
-                break;
-            }
-        }
-
-        if !is_member {
-            return Err(LeaseError::Unauthorized);
-        }
-
-        council_member.require_auth();
-
-        // Get pending slash
-        let mut pending_slash: PendingSlashVeto = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingSlash(lease_id))
-            .ok_or(LeaseError::LeaseNotFound)?;
-
-        if pending_slash.executed || pending_slash.vetoed {
-            return Err(LeaseError::InvalidState);
-        }
-
-        // Check if already voted
-        let vote_key = DataKey::VetoVote(lease_id, council_member.clone());
-        if env.storage().instance().get(&vote_key).is_some() {
-            return Err(LeaseError::AlreadyVoted);
-        }
-
-        // Record vote
-        if vote_for_veto {
-            pending_slash.veto_votes_for += member_voting_power;
-        } else {
-            pending_slash.veto_votes_against += member_voting_power;
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingSlash(lease_id), &pending_slash);
-        env.storage().instance().set(&vote_key, &true);
-
-        Ok(())
+    ) -> Result<crate::derived_access_token::HierarchyMetrics, LeaseError> {
+        DerivedAccessTokenManager::get_hierarchy_metrics(env, lease_id)
+            .map_err(|_| LeaseError::Unauthorised)
     }
 
-    pub fn execute_pending_slash(env: Env, lease_id: u64) -> Result<(), LeaseError> {
-        let pending_slash: PendingSlashVeto = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingSlash(lease_id))
-            .ok_or(LeaseError::LeaseNotFound)?;
-
-        if pending_slash.executed || pending_slash.vetoed {
-            return Err(LeaseError::InvalidState);
-        }
-
-        let current_time = env.ledger().timestamp();
-
-        // Check if timelock has expired
-        if current_time < pending_slash.timelock_end {
-            return Err(LeaseError::TimelockNotExpired);
-        }
-
-        // Check if veto was successful
-        let council: SecurityCouncil = env
-            .storage()
-            .instance()
-            .get(&DataKey::SecurityCouncil)
-            .ok_or(LeaseError::Unauthorized)?;
-
-        let veto_threshold = (council.total_voting_power as i128
-            * council.veto_threshold_bps as i128)
-            / 10000;
-
-        if pending_slash.veto_votes_for as i128 >= veto_threshold {
-            // Veto succeeded - cancel the slash
-            let mut updated_slash = pending_slash.clone();
-            updated_slash.vetoed = true;
-            updated_slash.executed = true;
-            env.storage()
-                .instance()
-                .set(&DataKey::PendingSlash(lease_id), &updated_slash);
-
-            // Return full deposit to tenant
-            let token_client =
-                token_contract::TokenClient::new(&env, &pending_slash.oracle_payload.lease_id.into());
-            // Note: Actual token transfer would need the correct token address from lease
-
-            return Ok(());
-        }
-
-        // Veto failed - execute the original slash
-        let mut updated_slash = pending_slash.clone();
-        updated_slash.executed = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingSlash(lease_id), &updated_slash);
-
-        // Execute the original slash logic
-        Self::execute_deposit_slash(env, pending_slash.oracle_payload)
+    /// Check if derived token is valid
+    pub fn is_derived_token_valid(env: Env, token_id: u128) -> Result<bool, LeaseError> {
+        DerivedAccessTokenManager::is_derived_token_valid(env, token_id)
+            .map_err(|_| LeaseError::Unauthorised)
     }
 
-    // ========================================================================
-    // Issue #118: DAO-Governed Dynamic Protocol Fee Updates
-    // ========================================================================
-
-    pub fn initialize_protocol_fee_config(
+    /// Recursively burn derived token hierarchy
+    pub fn burn_derived_token_hierarchy(
         env: Env,
-        admin: Address,
-        config: ProtocolFeeConfig,
-    ) -> Result<(), LeaseError> {
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(LeaseError::Unauthorised)?;
-        if admin != stored_admin {
-            return Err(LeaseError::Unauthorised);
-        }
-        admin.require_auth();
-
-        // Validate configuration
-        if config.current_fee_bps > config.max_fee_bps {
-            return Err(LeaseError::InvalidParameters);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::ProtocolFeeConfig, &config);
-
-        Ok(())
-    }
-
-    pub fn propose_fee_update(
-        env: Env,
-        proposer: Address,
-        new_fee_bps: u32,
-    ) -> Result<(), LeaseError> {
-        proposer.require_auth();
-
-        let config: ProtocolFeeConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProtocolFeeConfig)
-            .ok_or(LeaseError::Unauthorized)?;
-
-        // Validate fee is within bounds
-        if new_fee_bps < config.min_fee_bps || new_fee_bps > config.max_fee_bps {
-            return Err(LeaseError::InvalidParameters);
-        }
-
-        // Validate max increase limit
-        let current_fee = config.current_fee_bps;
-        if new_fee_bps > current_fee {
-            let increase = new_fee_bps - current_fee;
-            if increase > config.max_increase_bps {
-                return Err(LeaseError::InvalidParameters);
-            }
-        }
-
-        let current_time = env.ledger().timestamp();
-        let execution_time = current_time + config.update_timelock;
-
-        let pending_update = PendingFeeUpdate {
-            proposed_fee_bps: new_fee_bps,
-            proposed_by: proposer,
-            proposed_at: current_time,
-            execution_time,
-            votes_for: 0,
-            votes_against: 0,
-            executed: false,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingFeeUpdate, &pending_update);
-
-        Ok(())
-    }
-
-    pub fn vote_on_fee_update(
-        env: Env,
-        voter: Address,
-        vote_for: bool,
-    ) -> Result<(), LeaseError> {
-        voter.require_auth();
-
-        let mut pending_update: PendingFeeUpdate = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingFeeUpdate)
-            .ok_or(LeaseError::Unauthorized)?;
-
-        if pending_update.executed {
-            return Err(LeaseError::InvalidState);
-        }
-
-        // Simple vote counting (can be enhanced with token-weighted voting)
-        if vote_for {
-            pending_update.votes_for += 1;
-        } else {
-            pending_update.votes_against += 1;
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingFeeUpdate, &pending_update);
-
-        Ok(())
-    }
-
-    pub fn execute_fee_update(env: Env) -> Result<(), LeaseError> {
-        let mut pending_update: PendingFeeUpdate = env
-            .storage()
-            .instance()
-            .get(&DataKey::PendingFeeUpdate)
-            .ok_or(LeaseError::Unauthorized)?;
-
-        if pending_update.executed {
-            return Err(LeaseError::InvalidState);
-        }
-
-        let current_time = env.ledger().timestamp();
-
-        // Check timelock
-        if current_time < pending_update.execution_time {
-            return Err(LeaseError::TimelockNotExpired);
-        }
-
-        // Check if proposal passed (simple majority)
-        if pending_update.votes_for <= pending_update.votes_against {
-            return Err(LeaseError::ProposalRejected);
-        }
-
-        // Update fee configuration
-        let mut config: ProtocolFeeConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::ProtocolFeeConfig)
-            .ok_or(LeaseError::Unauthorized)?;
-
-        config.current_fee_bps = pending_update.proposed_fee_bps;
-        env.storage()
-            .instance()
-            .set(&DataKey::ProtocolFeeConfig, &config);
-
-        // Mark as executed
-        pending_update.executed = true;
-        env.storage()
-            .instance()
-            .set(&DataKey::PendingFeeUpdate, &pending_update);
-
-        Ok(())
-    }
-
-    pub fn get_protocol_fee_config(env: Env) -> Result<ProtocolFeeConfig, LeaseError> {
-        env.storage()
-            .instance()
-            .get(&DataKey::ProtocolFeeConfig)
-            .ok_or(LeaseError::Unauthorized)
-    }
-
-    // ========================================================================
-    // Issue #119: Quadratic Voting for Treasury Yield Allocation
-    // ========================================================================
-
-    pub fn create_governance_round(
-        env: Env,
-        admin: Address,
-        round_id: u64,
-        total_treasury_yield: i128,
-        allocation_options: soroban_sdk::Vec<AllocationOption>,
-    ) -> Result<(), LeaseError> {
-        let stored_admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .ok_or(LeaseError::Unauthorised)?;
-        if admin != stored_admin {
-            return Err(LeaseError::Unauthorised);
-        }
-        admin.require_auth();
-
-        let current_time = env.ledger().timestamp();
-        let snapshot_timestamp = current_time - FLASH_LOAN_PROTECTION_BUFFER;
-
-        let round = GovernanceRound {
-            round_id,
-            start_time: current_time,
-            end_time: current_time + GOVERNANCE_ROUND_DURATION,
-            total_treasury_yield,
-            allocation_options,
-            active: true,
-            snapshot_timestamp,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::GovernanceRound(round_id), &round);
-
-        Ok(())
-    }
-
-    pub fn cast_treasury_vote(
-        env: Env,
-        voter: Address,
-        round_id: u64,
-        option_id: u32,
-        tokens_committed: i128,
-    ) -> Result<(), LeaseError> {
-        voter.require_auth();
-
-        if tokens_committed <= 0 {
-            return Err(LeaseError::InvalidParameters);
-        }
-
-        let round: GovernanceRound = env
-            .storage()
-            .instance()
-            .get(&DataKey::GovernanceRound(round_id))
-            .ok_or(LeaseError::LeaseNotFound)?;
-
-        if !round.active {
-            return Err(LeaseError::InvalidState);
-        }
-
-        let current_time = env.ledger().timestamp();
-        if current_time > round.end_time {
-            return Err(LeaseError::GovernanceRoundEnded);
-        }
-
-        // Calculate quadratic voting power: sqrt(tokens_committed)
-        let voting_power = Self::integer_sqrt(tokens_committed);
-
-        // Record the vote
-        let vote = TreasuryVote {
-            round_id,
-            voter: voter.clone(),
-            option_id,
-            tokens_committed,
-            voting_power,
-            voted_at: current_time,
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::TreasuryVote(round_id, voter), &vote);
-
-        // Update allocation option totals
-        let mut options = round.allocation_options;
-        for i in 0..options.len() {
-            let mut option = options.get(i).unwrap();
-            if option.option_id == option_id {
-                option.total_quadratic_votes += voting_power;
-                options.set(i, option);
-                break;
-            }
-        }
-
-        let mut updated_round = round;
-        updated_round.allocation_options = options;
-        env.storage()
-            .instance()
-            .set(&DataKey::GovernanceRound(round_id), &updated_round);
-
-        Ok(())
-    }
-
-    pub fn finalize_governance_round(
-        env: Env,
-        round_id: u64,
-    ) -> Result<soroban_sdk::Vec<AllocationOption>, LeaseError> {
-        let mut round: GovernanceRound = env
-            .storage()
-            .instance()
-            .get(&DataKey::GovernanceRound(round_id))
-            .ok_or(LeaseError::LeaseNotFound)?;
-
-        if !round.active {
-            return Err(LeaseError::InvalidState);
-        }
-
-        let current_time = env.ledger().timestamp();
-        if current_time < round.end_time {
-            return Err(LeaseError::GovernanceRoundActive);
-        }
-
-        round.active = false;
-        env.storage()
-            .instance()
-            .set(&DataKey::GovernanceRound(round_id), &round);
-
-        // Calculate total quadratic votes
-        let mut total_quadratic_votes: i128 = 0;
-        for option in round.allocation_options.iter() {
-            total_quadratic_votes += option.total_quadratic_votes;
-        }
-
-        // Distribute treasury yield proportionally
-        let options = round.allocation_options;
-        // Note: Actual token transfers would be executed here based on allocations
-
-        Ok(options)
-    }
-
-    fn integer_sqrt(n: i128) -> i128 {
-        if n <= 0 {
-            return 0;
-        }
-        let mut x = n;
-        let mut y = (x + 1) / 2;
-        while y < x {
-            x = y;
-            y = (x + n / x) / 2;
-        }
-        x
-    }
-
-    // ========================================================================
-    // Issue #124: Highly Optimized get_active_leases Read-Only Query
-    // ========================================================================
-
-    /// Returns a summary of all currently active or pending leases.
-    ///
-    /// Read-only; performs no state mutations. Uses the `ActiveLeasesIndex` for
-    /// O(n) iteration rather than a full storage scan.
-    ///
-    /// # Returns
-    /// A [`Vec<ActiveLeaseSummary>`] containing one entry per active/pending lease.
-    pub fn get_active_leases(env: Env) -> soroban_sdk::Vec<ActiveLeaseSummary> {
-        // This is a read-only function - no state mutations
-        // Returns comprehensive lease data for frontend rendering
-
-        let mut active_leases = soroban_sdk::Vec::new(&env);
-
-        // Iterate through lease instances (in production, this would use an index)
-        // For optimization, we maintain an ActiveLeasesIndex
-        let lease_ids: soroban_sdk::Vec<u64> = env
-            .storage()
-            .instance()
-            .get(&DataKey::ActiveLeasesIndex)
-            .unwrap_or(soroban_sdk::Vec::new(&env));
-
-        for lease_id in lease_ids.iter() {
-            if let Ok(lease) = Self::get_lease_instance(env.clone(), lease_id) {
-                // Only return active leases
-                if lease.active
-                    && (lease.status == LeaseStatus::Active
-                        || lease.status == LeaseStatus::Pending)
-                {
-                    let summary = ActiveLeaseSummary {
-                        lease_id,
-                        landlord: lease.landlord,
-                        tenant: lease.tenant,
-                        rent_amount: lease.rent_amount,
-                        rent_per_sec: lease.rent_per_sec,
-                        deposit_amount: lease.deposit_amount,
-                        security_deposit: lease.security_deposit,
-                        start_date: lease.start_date,
-                        end_date: lease.end_date,
-                        property_uri: lease.property_uri,
-                        status: lease.status,
-                        payment_token: lease.payment_token,
-                        rent_paid: lease.rent_paid,
-                        cumulative_payments: lease.cumulative_payments,
-                        debt: lease.debt,
-                        active: lease.active,
-                        yield_delegation_enabled: lease.yield_delegation_enabled,
-                        equity_percentage_bps: lease.equity_percentage_bps,
-                    };
-                    active_leases.push_back(summary);
-                }
-            }
-        }
-
-        active_leases
-    }
-
-    pub fn add_to_active_leases_index(env: &Env, lease_id: u64) -> Result<(), LeaseError> {
-        let mut index: soroban_sdk::Vec<u64> = env
-            .storage()
-            .instance()
-            .get(&DataKey::ActiveLeasesIndex)
-            .unwrap_or(soroban_sdk::Vec::new(&env));
-
-        index.push_back(lease_id);
-        env.storage()
-            .instance()
-            .set(&DataKey::ActiveLeasesIndex, &index);
-
-        Ok(())
-    }
-
-    pub fn remove_from_active_leases_index(env: &Env, lease_id: u64) -> Result<(), LeaseError> {
-        let mut index: soroban_sdk::Vec<u64> = env
-            .storage()
-            .instance()
-            .get(&DataKey::ActiveLeasesIndex)
-            .unwrap_or(soroban_sdk::Vec::new(&env));
-
-        let mut new_index = soroban_sdk::Vec::new(&env);
-        for id in index.iter() {
-            if id != lease_id {
-                new_index.push_back(id);
-            }
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::ActiveLeasesIndex, &new_index);
-
-        Ok(())
-    }
-
-    // ========================================================================
-    // Issue #132: Ledger Rent Sweeper for Expired Lease Proposals
-    // ========================================================================
-
-    /// Permissionlessly sweep a single expired pending lease proposal.
-    ///
-    /// Any network relayer may call this function to delete a `Pending` lease
-    /// that has exceeded its 7-day initialization timeout without receiving a
-    /// security deposit. The relayer receives a small gas bounty from the
-    /// platform fee vault as an incentive.
-    ///
-    /// # Parameters
-    /// - `relayer`  – Address of the caller; receives the gas bounty.
-    /// - `lease_id` – ID of the candidate lease to sweep.
-    ///
-    /// # Errors
-    /// - [`LeaseError::LeaseNotFound`]   – No lease exists for `lease_id`.
-    /// - [`LeaseError::InvalidState`]    – Lease is not in `Pending` status.
-    /// - [`LeaseError::LeaseNotExpired`] – Initialization timeout has not elapsed.
-    pub fn sweep_expired_proposals(
-        env: Env,
-        relayer: Address,
-        lease_id: u64,
-    ) -> Result<(), LeaseError> {
-        expired_proposals::sweep_expired_proposals(&env, relayer, lease_id)
+        root_token_id: u128,
+    ) -> Result<u32, LeaseError> {
+        DerivedAccessTokenManager::recursive_burn_hierarchy(
+            env,
+            root_token_id,
+            crate::lessee_access_token::RevocationReason::LeaseTerminated,
+        ).map_err(|_| LeaseError::Unauthorised)
     }
 }
 
