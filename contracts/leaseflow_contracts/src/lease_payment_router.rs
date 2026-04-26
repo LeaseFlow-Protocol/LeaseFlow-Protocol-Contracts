@@ -90,7 +90,7 @@ impl LeaseContract {
         let mut lease = load_lease_instance_by_id(&env, lease_id)
             .ok_or(LeaseError::LeaseNotFound)?;
         
-        require!(lease.active, "Lease is not active");
+        require!(lease.flags & crate::lease_flags::ACTIVE != 0, "Lease is not active");
 
         // Verify payment authorization
         let is_primary = payer == lease.tenant;
@@ -206,7 +206,7 @@ impl LeaseContract {
         // Update lease state
         lease.status = LeaseStatus::Terminated;
         lease.deposit_status = crate::DepositStatus::Settled;
-        lease.active = false;
+        lease.flags &= !crate::lease_flags::ACTIVE;
 
         // Release NFT lock since lease is terminated
         LessorRightsNFT::release_nft_lock(env.clone(), lease_id)?;
