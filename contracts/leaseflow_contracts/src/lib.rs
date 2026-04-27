@@ -13,6 +13,18 @@ use soroban_sdk::{
 mod velocity_guard;
 use velocity_guard::VelocityGuard;
 
+mod sep12_identity;
+pub use sep12_identity::Sep12IdentityModule;
+
+mod timelock_upgrade;
+pub use timelock_upgrade::TimelockUpgradeModule;
+
+mod oracle_governance;
+pub use oracle_governance::OracleGovernanceModule;
+
+#[cfg(test)]
+mod governance_tests;
+
 #[cfg(test)]
 mod velocity_guard_tests;
 
