@@ -146,22 +146,36 @@ impl VelocityGuard {
     /// Get velocity tracker for a lessor
     pub fn get_velocity_tracker(env: &Env, lessor: &Address) -> Result<VelocityTracker, LeaseError> {
         let key = DataKey::VelocityTracker(lessor.clone());
-        env.storage()
-            .instance()
-            .get(&key)
-            .ok_or(LeaseError::LeaseNotFound)
+        if let Some(tracker) = env.storage().temporary().get(&key) {
+            Ok(tracker)
+        } else {
+            // If evicted from temporary storage, return a default fresh tracker.
+            // Note: This resets total_leases as well, which is an accepted tradeoff
+            // for saving instance storage bloat on inactive lessors.
+            Ok(VelocityTracker {
+                lessor: lessor.clone(),
+                total_leases: 0,
+                terminations_24h: 0,
+                last_termination_times: Vec::new(env),
+                is_paused: false,
+                pause_timestamp: None,
+            })
+        }
     }
     
     /// Check if velocity tracker exists
     pub fn has_velocity_tracker(env: &Env, lessor: &Address) -> bool {
         let key = DataKey::VelocityTracker(lessor.clone());
-        env.storage().instance().has(&key)
+        env.storage().temporary().has(&key)
     }
     
     /// Save velocity tracker
     pub fn save_velocity_tracker(env: &Env, lessor: &Address, tracker: &VelocityTracker) {
         let key = DataKey::VelocityTracker(lessor.clone());
-        env.storage().instance().set(&key, tracker);
+        // Extend TTL to roughly 30 days (17280 * 15 ledgers, assuming 10s per ledger: 30 * 24 * 60 * 60 / 5)
+        const VELOCITY_TRACKER_TTL: u32 = 518_400; // ~30 days at ~5s per ledger
+        env.storage().temporary().set(&key, tracker);
+        env.storage().temporary().extend_ttl(&key, VELOCITY_TRACKER_TTL, VELOCITY_TRACKER_TTL);
     }
     
     /// Check if lessor is paused
