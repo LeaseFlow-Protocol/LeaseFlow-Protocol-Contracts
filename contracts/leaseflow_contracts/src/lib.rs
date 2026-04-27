@@ -137,6 +137,15 @@ pub struct OracleConfig {
     pub tier: OracleTier,
     pub status: OracleStatus,
     pub last_successful_timestamp: u64,
+}
+
+/// Ephemeral oracle retry tracking stored in Temporary storage.
+/// This data only needs to survive the retry window (~24 hours) and
+/// intentionally resets on eviction, preventing stale failure counts
+/// from permanently blacklisting a recovered oracle.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OracleRetryStats {
     pub demotion_timestamp: Option<u64>,
     pub failure_count: u32,
 }
@@ -389,6 +398,12 @@ pub enum DataKey {
     NonReentrant,
     // Issue #125: Historical Leases Index for cursor-based pagination
     HistoricalLeasesIndex,
+    // Tiered-storage: Temporary keys for ephemeral velocity guard state
+    VelocityTracker(Address),
+    PausedLessor(Address),
+    DaoApprovalRequest(u64),
+    // Tiered-storage: Temporary key for ephemeral oracle retry counters
+    OracleRetryStats(BytesN<32>),
 }
 
 #[contracttype]
@@ -887,26 +902,32 @@ pub fn delete_lease_instance(env: &Env, lease_id: u64) {
         .remove(&DataKey::LeaseInstance(lease_id));
 }
 
+// 1 year TTL for Usage Rights – they are cryptographic access grants tied
+// to active leases and must not be silently evicted.
+const USAGE_RIGHTS_TTL_LEDGERS: u32 = YEAR_IN_LEDGERS;
+
 pub fn save_usage_rights(
     env: &Env,
     nft_contract: Address,
     token_id: u128,
     usage_rights: &UsageRights,
 ) {
+    let key = DataKey::UsageRights(nft_contract, token_id);
+    env.storage().persistent().set(&key, usage_rights);
     env.storage()
-        .instance()
-        .set(&DataKey::UsageRights(nft_contract, token_id), usage_rights);
+        .persistent()
+        .extend_ttl(&key, USAGE_RIGHTS_TTL_LEDGERS, USAGE_RIGHTS_TTL_LEDGERS);
 }
 
 pub fn delete_usage_rights(env: &Env, nft_contract: Address, token_id: u128) {
     env.storage()
-        .instance()
+        .persistent()
         .remove(&DataKey::UsageRights(nft_contract, token_id));
 }
 
 pub fn load_usage_rights(env: &Env, nft_contract: Address, token_id: u128) -> Option<UsageRights> {
     env.storage()
-        .instance()
+        .persistent()
         .get(&DataKey::UsageRights(nft_contract, token_id))
 }
 
@@ -2811,6 +2832,40 @@ impl LeaseContract {
             .set(&DataKey::OracleConfig(oracle_pubkey.clone()), config);
     }
 
+    /// Load ephemeral oracle retry stats from Temporary storage.
+    /// Returns a zeroed default if the data has been evicted, which is the
+    /// correct behaviour – an oracle whose retry counter expired is treated
+    /// as if it has had no recent failures.
+    fn get_oracle_retry_stats(env: &Env, oracle_pubkey: &BytesN<32>) -> OracleRetryStats {
+        env.storage()
+            .temporary()
+            .get(&DataKey::OracleRetryStats(oracle_pubkey.clone()))
+            .unwrap_or(OracleRetryStats {
+                demotion_timestamp: None,
+                failure_count: 0,
+            })
+    }
+
+    /// Persist ephemeral oracle retry stats to Temporary storage.
+    /// TTL is set to ~48 h (roughly 17280 ledgers at 10 s/ledger) so that
+    /// the retry window is preserved but the data cannot live forever.
+    fn set_oracle_retry_stats(env: &Env, oracle_pubkey: &BytesN<32>, stats: &OracleRetryStats) {
+        let key = DataKey::OracleRetryStats(oracle_pubkey.clone());
+        // ~48 hours at ~5 second ledger close
+        const ORACLE_RETRY_TTL: u32 = 17_280;
+        env.storage().temporary().set(&key, stats);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, ORACLE_RETRY_TTL, ORACLE_RETRY_TTL);
+    }
+
+    /// Remove oracle retry stats (e.g. on successful reset).
+    fn remove_oracle_retry_stats(env: &Env, oracle_pubkey: &BytesN<32>) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::OracleRetryStats(oracle_pubkey.clone()));
+    }
+
     fn get_fallback_hierarchy(env: &Env) -> Option<FallbackHierarchy> {
         env.storage()
             .instance()
@@ -2852,17 +2907,21 @@ impl LeaseContract {
             return Ok(()); // Already demoted
         }
         
+        // Update persistent status (tier/whitelist) in instance() storage.
         config.status = OracleStatus::Demoted;
-        config.demotion_timestamp = Some(env.ledger().timestamp());
-        config.failure_count += 1;
-        
         Self::set_oracle_config(env, oracle_pubkey, &config);
+
+        // Update ephemeral retry stats in temporary() storage to prevent bloat.
+        let mut stats = Self::get_oracle_retry_stats(env, oracle_pubkey);
+        stats.demotion_timestamp = Some(env.ledger().timestamp());
+        stats.failure_count += 1;
+        Self::set_oracle_retry_stats(env, oracle_pubkey, &stats);
         
         OracleDemoted {
             oracle_pubkey: oracle_pubkey.clone(),
             reason,
             demotion_timestamp: env.ledger().timestamp(),
-            failure_count: config.failure_count,
+            failure_count: stats.failure_count,
         }
         .publish(env);
         
@@ -2927,19 +2986,25 @@ impl LeaseContract {
         match config.status {
             OracleStatus::Active => Ok(true),
             OracleStatus::Demoted => {
-                // Check if enough time has passed to allow retry
-                if let Some(demotion_time) = config.demotion_timestamp {
+                // Read ephemeral retry stats from temporary() storage.
+                // If evicted (TTL expired), stats default to zeroed values,
+                // which is treated as "no recent failures → allow retry".
+                let stats = Self::get_oracle_retry_stats(env, oracle_pubkey);
+
+                if let Some(demotion_time) = stats.demotion_timestamp {
                     let current_time = env.ledger().timestamp();
                     let time_since_demotion = current_time.saturating_sub(demotion_time);
                     
                     // Allow retry after 24 hours if failure count is below threshold
-                    if time_since_demotion > 24 * 60 * 60 && config.failure_count < MAX_ORACLE_FAILURES {
+                    if time_since_demotion > 24 * 60 * 60 && stats.failure_count < MAX_ORACLE_FAILURES {
                         Ok(true)
                     } else {
                         Ok(false)
                     }
                 } else {
-                    Ok(false)
+                    // No demotion timestamp in temporary storage means the retry
+                    // window has elapsed – allow the oracle to try again.
+                    Ok(true)
                 }
             },
             OracleStatus::Failed => Ok(false),
@@ -3395,11 +3460,10 @@ impl LeaseContract {
             .ok_or(LeaseError::OracleNotWhitelisted)?;
         
         config.status = OracleStatus::Active;
-        config.failure_count = 0;
-        config.demotion_timestamp = None;
         config.last_successful_timestamp = env.ledger().timestamp();
         
         Self::set_oracle_config(&env, &oracle_pubkey, &config);
+        Self::remove_oracle_retry_stats(&env, &oracle_pubkey);
         
         Ok(())
     }
@@ -4058,6 +4122,7 @@ mod test;
 mod upgrade_tests;
 mod oracle_fallback_tests;
 mod asset_metadata_tests;
+mod storage_tier_tests;
 
 // Global Escrow Freeze Circuit Breaker Modules
 pub mod escrow_vault;
