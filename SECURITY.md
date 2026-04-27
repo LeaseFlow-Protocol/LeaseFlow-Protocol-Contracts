@@ -65,7 +65,53 @@ This invariant is guaranteed through rigorous formal verification using property
 - Dust recovery cannot exceed tracked dust
 - Comprehensive audit trail for dust operations
 
-#### 4. Concurrent Operations Safety (`fuzz_concurrent_operations.rs`)
+#### 4. Reentrancy Guards (`lib.rs` – Issue #135)
+
+**Mathematical Guarantee**: No external call (DEX swap, token transfer) can re-enter a protected function before its state mutations are committed.
+
+**Implementation**:
+- `acquire_reentrancy_lock` / `release_reentrancy_lock` helpers use Soroban **Temporary** storage (`DataKey::NonReentrant`) so the lock is automatically cleared at transaction end on both success and failure paths.
+- Protected functions: `create_lease_instance` (DEX swap path) and `execute_deposit_slash` (oracle-triggered token transfers).
+- A `ReentrancyAttemptDetected` event is emitted before panicking so off-chain monitors can alert.
+
+**Security Properties**:
+- Lock acquired before any external call; released after all transfers complete.
+- Checks-Effects-Interactions pattern enforced across the entire leasing module.
+- Negligible compute overhead: one temporary storage read + write per protected call.
+
+**Acceptance Criteria Met**:
+- ✅ Nested calls into protected functions strictly revert and roll back all pending state mutations.
+- ✅ Temporary guard clears correctly on both success and failure execution paths.
+- ✅ Security implementation adds negligible compute overhead to standard lease executions.
+
+#### 5. Struct Packing and Bitmasking (`lib.rs` – Issue #128)
+
+**Mathematical Guarantee**: `LeaseInstance` serialised byte size is minimised by ordering fields largest → smallest and replacing six `bool` fields with a single `u8` bitmask.
+
+**Bitmask Schema** (`lease_flags` module):
+
+| Bit | Constant                  | Meaning                    |
+|-----|---------------------------|----------------------------|
+| 0   | `ACTIVE`                  | Lease is active            |
+| 1   | `FLAT_FEE_APPLIED`        | Late flat fee charged once |
+| 2   | `HAD_LATE_PAYMENT`        | Tenant had a late payment  |
+| 3   | `HAS_PET`                 | Pet clause active          |
+| 4   | `YIELD_DELEGATION_ENABLED`| Yield delegation on        |
+| 5   | `PAUSED`                  | Lease is paused            |
+
+**Usage**:
+```rust
+// Read
+let is_active = lease.flags & lease_flags::ACTIVE != 0;
+// Set
+lease.flags |= lease_flags::PAUSED;
+// Clear
+lease.flags &= !lease_flags::ACTIVE;
+```
+
+**Security Consideration**: Bitwise operations are isolated to single-bit masks; adjacent flags cannot be accidentally flipped by a single operation.
+
+
 
 **Mathematical Guarantee**: The invariant holds under concurrent lease operations, race conditions, and simultaneous state changes.
 
@@ -119,7 +165,7 @@ This invariant is guaranteed through rigorous formal verification using property
 **Mitigation**: Atomic operations and invariant verification prevent race condition exploits.
 
 #### 4. Reentrancy Attacks
-**Mitigation**: State changes occur before external calls, following checks-effects-interactions pattern.
+**Mitigation**: `acquire_reentrancy_lock` / `release_reentrancy_lock` helpers use Soroban Temporary storage (`DataKey::NonReentrant`) to enforce a strict NON_REENTRANT guard on `create_lease_instance` and `execute_deposit_slash`. State changes occur before external calls (Checks-Effects-Interactions). A `ReentrancyAttemptDetected` event is emitted on detection.
 
 #### 5. Integer Division Truncation
 **Mitigation**: Protocol-favorable rounding and dust accounting prevent loss from truncation.
@@ -309,7 +355,7 @@ This formal verification provides enterprise-grade assurance for institutional r
 
 ---
 
-**Last Updated**: 2026-04-23
-**Version**: 1.0.0
+**Last Updated**: 2026-04-26
+**Version**: 1.1.0
 **Formal Verification Status**: ✅ COMPLETE
 **Security Audit Status**: ✅ COMPLETE

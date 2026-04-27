@@ -46,7 +46,6 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         status: LeaseStatus::Active,
         nft_contract: None,
         token_id: None,
-        active: true,
         rent_paid: 0,
         expiry_time: END,
         buyout_price: None,
@@ -58,12 +57,10 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         grace_period_end: END,
         late_fee_flat: 0,
         late_fee_per_sec: 0,
-        flat_fee_applied: false,
         seconds_late_charged: 0,
         withdrawal_address: None,
         rent_withdrawn: 0,
         arbitrators: soroban_sdk::Vec::new(env),
-        paused: false,
         pause_reason: None,
         paused_at: None,
         pause_initiator: None,
@@ -71,14 +68,14 @@ fn make_lease(env: &Env, landlord: &Address, tenant: &Address) -> LeaseInstance 
         rent_pull_authorized_amount: None,
         last_rent_pull_timestamp: None,
         billing_cycle_duration: 2_592_000,
-        yield_delegation_enabled: false,
         yield_accumulated: 0,
         equity_balance: 0,
         equity_percentage_bps: 0,
-        had_late_payment: false,
-        has_pet: false,
         pet_deposit_amount: 0,
         pet_rent_amount: 0,
+        flags: crate::lease_flags::ACTIVE,
+        early_termination_fee_bps: None,
+        fixed_penalty: None,
     }
 }
 
@@ -519,7 +516,7 @@ fn test_yield_accumulation_preservation() {
     
     // Create lease with yield accumulation
     let mut lease = make_lease(&env, &landlord, &tenant);
-    lease.yield_delegation_enabled = true;
+    lease.flags |= crate::lease_flags::YIELD_DELEGATION_ENABLED;
     lease.yield_accumulated = 100;
     lease.equity_balance = 50;
     seed_lease(&env, &contract_id, LEASE_ID, &lease);
@@ -539,7 +536,7 @@ fn test_yield_accumulation_preservation() {
     
     // Check that yield-related fields are preserved
     let updated_lease = read_lease(&env, &contract_id, LEASE_ID).unwrap();
-    assert!(updated_lease.yield_delegation_enabled);
+    assert!(updated_lease.flags & crate::lease_flags::YIELD_DELEGATION_ENABLED != 0);
     assert_eq!(updated_lease.yield_accumulated, 100);
     assert_eq!(updated_lease.equity_balance, 50);
 }
