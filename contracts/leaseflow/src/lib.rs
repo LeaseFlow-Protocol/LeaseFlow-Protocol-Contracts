@@ -2,6 +2,10 @@
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, env, symbol, Address, Bytes, Symbol, Vec, Map, U256, i64, u64};
 use leaseflow_math::{calculate_prorated_rent, calculate_termination_refund};
 
+// Issue #179: Rate limiting for lease creation
+mod lease_creation_rate_limit;
+use lease_creation_rate_limit::LeaseCreationRateLimit;
+
 // SEP-40 Oracle interface
 #[contracttype]
 pub struct PriceData {
@@ -55,6 +59,7 @@ pub enum Error {
     VolatilityCircuitBreaker = 17,
     OracleCallFailed = 18,
     InvalidFiatPegConfig = 19,
+    RateLimitExceeded = 20,
 }
 
 // Events
@@ -257,6 +262,10 @@ impl LeaseFlowContract {
             }
         }
 
+        // Issue #179: Rate limiting for lease creation
+        LeaseCreationRateLimit::initialize_address(&env, &lessor)?;
+        LeaseCreationRateLimit::check_creation_limits(&env, &lessor)?;
+
         let mut data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
         let lease_id = data.next_lease_id;
 
@@ -298,6 +307,9 @@ impl LeaseFlowContract {
         data.leases.set(lease_id, lease);
         data.next_lease_id += 1;
         env.storage().instance().set(&DATA_KEY, &data);
+
+        // Issue #179: Record lease creation for rate tracking
+        LeaseCreationRateLimit::record_creation(&env, &lessor)?;
 
         // Emit event
         env.events().publish(

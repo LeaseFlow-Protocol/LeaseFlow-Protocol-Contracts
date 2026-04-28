@@ -13,6 +13,12 @@ use soroban_sdk::{
 mod velocity_guard;
 use velocity_guard::VelocityGuard;
 
+mod lease_creation_rate_limit;
+use lease_creation_rate_limit::LeaseCreationRateLimit;
+
+mod rate_limit_admin;
+use rate_limit_admin::RateLimitAdmin;
+
 mod sep12_identity;
 pub use sep12_identity::Sep12IdentityModule;
 
@@ -27,6 +33,9 @@ mod governance_tests;
 
 #[cfg(test)]
 mod velocity_guard_tests;
+
+#[cfg(test)]
+mod lease_creation_rate_limit_tests;
 
 #[cfg(test)]
 mod derived_access_token_tests;
@@ -417,6 +426,10 @@ pub enum DataKey {
     OracleRetryStats(BytesN<32>),
     // Tiered-storage: Temporary key for oracle rate limiting (1-hour windows)
     OracleRateLimit(BytesN<32>, u64),
+    // Issue #179: Rate limiting for lease creation to prevent DoS attacks
+    CreationRateLimit(Address),
+    RateLimitPolicy,
+    RateLimitWhitelist(Address),
 }
 
 #[contracttype]
@@ -840,6 +853,8 @@ pub enum LeaseError {
     AssetThawFailed = 37,
     RegistryCallFailed = 38,
     AssetVerificationFailed = 39,
+    VelocityLimitExceeded = 40,
+    RateLimitExceeded = 41,
 }
 
 macro_rules! require {
@@ -1453,6 +1468,10 @@ impl LeaseContract {
         landlord.require_auth();
         Self::require_kyc(&env, &landlord, &tenant)?;
         Self::require_stablecoin(&env, &payment_token)?;
+        
+        // Issue #179: Rate limiting for lease creation
+        LeaseCreationRateLimit::initialize_address(&env, &landlord)?;
+        LeaseCreationRateLimit::check_creation_limits(&env, &landlord)?;
         let lease_id = symbol_short!("lease");
         let lease = Lease {
             landlord,
@@ -1479,6 +1498,10 @@ impl LeaseContract {
             payment_token,
         };
         env.storage().instance().set(&lease_id, &lease);
+        
+        // Issue #179: Record lease creation for rate tracking
+        LeaseCreationRateLimit::record_creation(&env, &landlord)?;
+        
         Ok(lease_id)
     }
 
@@ -1498,6 +1521,10 @@ impl LeaseContract {
         landlord.require_auth();
         Self::require_kyc(&env, &landlord, &tenant)?;
         Self::require_stablecoin(&env, &payment_token)?;
+        
+        // Issue #179: Rate limiting for lease creation
+        LeaseCreationRateLimit::initialize_address(&env, &landlord)?;
+        LeaseCreationRateLimit::check_creation_limits(&env, &landlord)?;
         
         let current_time = env.ledger().timestamp();
         let lease_id = env.ledger().sequence();
@@ -1583,6 +1610,9 @@ impl LeaseContract {
             rate: rent_per_second,
         }
         .publish(&env);
+        
+        // Issue #179: Record lease creation for rate tracking
+        LeaseCreationRateLimit::record_creation(&env, &landlord)?;
         
         Ok(lease_id)
     }
@@ -1945,6 +1975,10 @@ impl LeaseContract {
         }
         landlord.require_auth();
         params.tenant.require_auth();
+        
+        // Issue #179: Rate limiting for lease creation
+        LeaseCreationRateLimit::initialize_address(&env, &landlord)?;
+        LeaseCreationRateLimit::check_creation_limits(&env, &landlord)?;
 
         // RWA Asset Verification - Required if registry address is provided
         let (freeze_proof, ownership_verified) = if let (Some(registry_address), Some(asset_id)) = 
@@ -2056,6 +2090,10 @@ impl LeaseContract {
             property_hash: params.property_uri,
         }
         .publish(&env);
+        
+        // Issue #179: Record lease creation for rate tracking
+        LeaseCreationRateLimit::record_creation(&env, &landlord)?;
+        
         Ok(())
     }
 
@@ -3149,6 +3187,61 @@ impl LeaseContract {
             .instance()
             .remove(&DataKey::WhitelistedOracle(oracle_pubkey));
         Ok(())
+    }
+
+    // Issue #179: Rate limit admin functions
+    
+    /// Get the current rate limit policy
+    pub fn get_rate_limit_policy(env: Env) -> crate::rate_limit_admin::RateLimitPolicy {
+        RateLimitAdmin::get_policy(&env)
+    }
+
+    /// Update rate limit policy (admin only)
+    pub fn update_rate_limit_policy(
+        env: Env,
+        admin: Address,
+        max_per_hour: u32,
+        max_per_day: u32,
+        rate_limit_duration: u64,
+    ) -> Result<(), LeaseError> {
+        RateLimitAdmin::update_policy(&env, &admin, max_per_hour, max_per_day, rate_limit_duration)
+    }
+
+    /// Toggle rate limiting on/off (admin only)
+    pub fn toggle_rate_limiting(env: Env, admin: Address, enabled: bool) -> Result<(), LeaseError> {
+        RateLimitAdmin::toggle_rate_limiting(&env, &admin, enabled)
+    }
+
+    /// Check if an address is whitelisted from rate limits
+    pub fn is_rate_limit_whitelisted(env: Env, address: Address) -> bool {
+        RateLimitAdmin::is_whitelisted(&env, &address)
+    }
+
+    /// Add address to rate limit whitelist (admin only)
+    pub fn whitelist_rate_limit_address(
+        env: Env,
+        admin: Address,
+        address: Address,
+        reason: String,
+    ) -> Result<(), LeaseError> {
+        RateLimitAdmin::whitelist_address(&env, &admin, &address, reason)
+    }
+
+    /// Remove address from rate limit whitelist (admin only)
+    pub fn remove_rate_limit_whitelist(
+        env: Env,
+        admin: Address,
+        address: Address,
+    ) -> Result<(), LeaseError> {
+        RateLimitAdmin::remove_from_whitelist(&env, &admin, &address)
+    }
+
+    /// Get whitelist entry for a specific address
+    pub fn get_rate_limit_whitelist_entry(
+        env: Env,
+        address: Address,
+    ) -> Option<crate::rate_limit_admin::WhitelistedAddress> {
+        RateLimitAdmin::get_whitelist_entry(&env, &address)
     }
 
     fn is_oracle_whitelisted(env: &Env, oracle_pubkey: &BytesN<32>) -> bool {
