@@ -319,10 +319,24 @@ pub struct UsageRights {
     pub valid_until: u64,
 }
 
+/// Parameters for amending an existing lease's financial or temporal terms.
+///
+/// Both fields are optional; supply only the fields you wish to change.
+/// At least one field should be `Some` — passing all `None` is a no-op.
+///
+/// # Constraints
+/// - `new_rent_per_sec`: must be `> 0` if provided; zero-rate leases are not
+///   supported and will cause downstream accounting to produce zero debt.
+/// - `new_end_date`: must be strictly greater than the current `start_date`
+///   and the current ledger timestamp; back-dating an end date is rejected.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LeaseAmendment {
+    /// New per-second rent rate in the lease's payment token (smallest unit).
+    /// `None` leaves the existing rate unchanged.
     pub new_rent_per_sec: Option<i128>,
+    /// New lease end timestamp (Unix seconds).
+    /// `None` leaves the existing end date unchanged.
     pub new_end_date: Option<u64>,
 }
 
@@ -1701,6 +1715,27 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Marks the deposit as `Settled`, unblocking `terminate_lease`.
+    ///
+    /// Can be called by the landlord, tenant, or admin.  The actual token
+    /// transfers are handled by the caller prior to this call; this function
+    /// only updates the on-chain status flag.
+    ///
+    /// # Parameters
+    /// - `lease_id`        – ID of the target lease.
+    /// - `caller`          – Must be the landlord, tenant, or admin.
+    /// - `tenant_refund`   – Informational: amount returned to the tenant (not
+    ///                       transferred here).
+    /// - `landlord_payout` – Informational: amount paid to the landlord (not
+    ///                       transferred here).
+    /// - `_dao_payout`     – Reserved for future DAO fee routing; currently unused.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]  – `caller` is not landlord, tenant, or admin.
+    ///
+    /// # Authorization
+    /// Requires `caller.require_auth()`.
     pub fn settle_deposit(
         env: Env,
         lease_id: u64,
@@ -1985,6 +2020,20 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Sets or updates the address to which the landlord's accumulated rent is
+    /// transferred when `withdraw_rent` is called.
+    ///
+    /// # Parameters
+    /// - `lease_id`           – ID of the target lease.
+    /// - `withdrawal_address` – Destination address for rent withdrawals.
+    ///                          Must be a valid Stellar account or contract address.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]  – Caller is not the landlord of the lease.
+    ///
+    /// # Authorization
+    /// Requires `lease.landlord.require_auth()`.
     pub fn set_withdrawal_address(
         env: Env,
         lease_id: u64,
@@ -1998,6 +2047,22 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Transfers all undrawn rent (`rent_paid − rent_withdrawn`) to the
+    /// landlord's configured withdrawal address.
+    ///
+    /// # Parameters
+    /// - `lease_id`          – ID of the target lease.
+    /// - `_token_contract_id`– Reserved for future multi-token support; currently
+    ///                         the lease's own `payment_token` is used.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`]          – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]           – Caller is not the landlord.
+    /// - [`LeaseError::WithdrawalAddressNotSet`]– No withdrawal address has been
+    ///                                            configured via `set_withdrawal_address`.
+    ///
+    /// # Authorization
+    /// Requires `lease.landlord.require_auth()`.
     pub fn withdraw_rent(
         env: Env,
         lease_id: u64,
@@ -2250,6 +2315,20 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Emits an `AssetReclaimed` event to signal that the physical or digital
+    /// asset has been returned.  Does not transfer tokens or mutate lease state.
+    ///
+    /// # Parameters
+    /// - `lease_id` – ID of the target lease.
+    /// - `caller`   – Must be the landlord or tenant.
+    /// - `reason`   – Human-readable reason string (e.g. `"Lease expired"`).
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]  – `caller` is neither landlord nor tenant.
+    ///
+    /// # Authorization
+    /// Requires `caller.require_auth()`.
     pub fn reclaim_asset(
         env: Env,
         lease_id: u64,
@@ -2269,6 +2348,27 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Concludes a lease by applying a damage deduction to the deposit and
+    /// returning the remainder to the tenant.
+    ///
+    /// # Parameters
+    /// - `lease_id`         – ID of the lease to conclude.
+    /// - `landlord`         – Must match the stored landlord address.
+    /// - `damage_deduction` – Amount to withhold from the deposit for damages.
+    ///                        Must satisfy `0 ≤ damage_deduction ≤ deposit_amount`.
+    ///                        Pass `0` for a full refund (no damages).
+    ///
+    /// # Returns
+    /// The tenant refund amount: `deposit_amount − damage_deduction`.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`]   – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]    – `landlord` does not match the stored landlord.
+    /// - [`LeaseError::InvalidDeduction`]– `damage_deduction` is negative or exceeds
+    ///                                     `deposit_amount`.
+    ///
+    /// # Authorization
+    /// Requires `landlord.require_auth()`.
     pub fn conclude_lease(
         env: Env,
         lease_id: u64,
@@ -2292,6 +2392,20 @@ impl LeaseContract {
         Ok(lease.deposit_amount - damage_deduction)
     }
 
+    /// Assigns an inspector to a lease who is authorised to verify completed
+    /// repairs via `verify_repair`.
+    ///
+    /// # Parameters
+    /// - `lease_id`  – ID of the target lease.
+    /// - `landlord`  – Must match the stored landlord address.
+    /// - `inspector` – Address of the inspector to assign.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]  – `landlord` does not match the stored landlord.
+    ///
+    /// # Authorization
+    /// Requires `landlord.require_auth()`.
     pub fn set_inspector(
         env: Env,
         lease_id: u64,
@@ -2309,6 +2423,23 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Records a maintenance issue reported by the tenant, advancing the lease's
+    /// `maintenance_status` to `Reported`.
+    ///
+    /// Once reported, the landlord must call `submit_repair_proof` to progress
+    /// the status to `Fixed`, after which the assigned inspector can call
+    /// `verify_repair` to release any withheld rent.
+    ///
+    /// # Parameters
+    /// - `lease_id` – ID of the target lease.
+    /// - `tenant`   – Must match the stored tenant address.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]  – `tenant` does not match the stored tenant.
+    ///
+    /// # Authorization
+    /// Requires `tenant.require_auth()`.
     pub fn report_maintenance_issue(
         env: Env,
         lease_id: u64,
@@ -2326,6 +2457,24 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Submits an on-chain proof of repair, advancing the lease's
+    /// `maintenance_status` from `Reported` to `Fixed`.
+    ///
+    /// The `proof_hash` is typically the SHA-256 or IPFS CID of the repair
+    /// documentation (photos, invoices, etc.) stored off-chain.
+    ///
+    /// # Parameters
+    /// - `lease_id`   – ID of the target lease.
+    /// - `landlord`   – Must match the stored landlord address.
+    /// - `proof_hash` – 32-byte hash of the off-chain repair evidence.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]  – `landlord` does not match the stored landlord.
+    /// - Panics with `"No issue reported"` if `maintenance_status ≠ Reported`.
+    ///
+    /// # Authorization
+    /// Requires `landlord.require_auth()`.
     pub fn submit_repair_proof(
         env: Env,
         lease_id: u64,
@@ -2357,6 +2506,24 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Reclaims the NFT asset held in escrow after the deposit has been fully
+    /// drawn down (i.e. `deposit_amount == 0`).
+    ///
+    /// Transfers the NFT back to the landlord, marks the lease `Terminated`,
+    /// and emits `AssetReclaimed`.
+    ///
+    /// # Parameters
+    /// - `lease_id` – ID of the target lease.
+    /// - `caller`   – Must be the landlord or admin.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`]    – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]     – `caller` is neither landlord nor admin.
+    /// - [`LeaseError::DepositNotSettled`]– `deposit_amount > 0`; funds remain in
+    ///                                      escrow and must be settled first.
+    ///
+    /// # Authorization
+    /// Requires `caller.require_auth()`.
     pub fn reclaim(env: Env, lease_id: u64, caller: Address) -> Result<(), LeaseError> {
         let mut lease =
             load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
@@ -2405,6 +2572,24 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Verifies a completed repair and releases any withheld rent to the landlord.
+    ///
+    /// Only the inspector assigned via `set_inspector` may call this function.
+    /// On success, `maintenance_status` advances to `Verified` and the full
+    /// `withheld_rent` balance is credited to `cumulative_payments` and `rent_paid`.
+    ///
+    /// # Parameters
+    /// - `lease_id`  – ID of the target lease.
+    /// - `inspector` – Must match the inspector assigned via `set_inspector`.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]  – No inspector is set, or `inspector` does
+    ///                                   not match the assigned inspector.
+    /// - Panics with `"Repair not marked as fixed"` if `maintenance_status ≠ Fixed`.
+    ///
+    /// # Authorization
+    /// Requires `inspector.require_auth()`.
     pub fn verify_repair(env: Env, lease_id: u64, inspector: Address) -> Result<(), LeaseError> {
         let mut lease =
             load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
@@ -2438,6 +2623,14 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Sets the contract admin.  Can only be called once; subsequent calls
+    /// return `Unauthorised` to prevent admin takeover.
+    ///
+    /// # Parameters
+    /// - `admin` – Address to designate as the contract administrator.
+    ///
+    /// # Errors
+    /// - [`LeaseError::Unauthorised`] – An admin has already been set.
     pub fn set_admin(env: Env, admin: Address) -> Result<(), LeaseError> {
         if env.storage().instance().has(&DataKey::Admin) {
             return Err(LeaseError::Unauthorised);
@@ -2446,6 +2639,21 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Configures the platform fee used to fund termination bounties.
+    ///
+    /// # Parameters
+    /// - `admin`         – Must match the stored admin address.
+    /// - `fee_amount`    – Total fee balance held by the platform (in smallest
+    ///                     token units).  Bounties are calculated as
+    ///                     `fee_amount × 1000 / 10_000` (10 %).
+    /// - `fee_token`     – Token contract address for the fee.
+    /// - `fee_recipient` – Address that holds the fee balance and pays bounties.
+    ///
+    /// # Errors
+    /// - [`LeaseError::Unauthorised`] – `admin` does not match the stored admin.
+    ///
+    /// # Authorization
+    /// Requires `admin.require_auth()`.
     pub fn set_platform_fee(
         env: Env,
         admin: Address,
@@ -2474,6 +2682,23 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Raises a deposit dispute, setting the lease status to `Disputed` and
+    /// the deposit status to `Disputed`.
+    ///
+    /// Either party may initiate a dispute.  Once disputed, the deposit is
+    /// frozen until resolved via `resolve_dispute` (arbitrator) or
+    /// `mutual_deposit_release` (both parties agree).
+    ///
+    /// # Parameters
+    /// - `lease_id` – ID of the target lease.
+    /// - `caller`   – Must be the landlord or tenant of the lease.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]  – `caller` is neither landlord nor tenant.
+    ///
+    /// # Authorization
+    /// Requires `caller.require_auth()`.
     pub fn dispute_deposit(env: Env, lease_id: u64, caller: Address) -> Result<(), LeaseError> {
         let mut lease =
             load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
@@ -2490,6 +2715,28 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Resolves a deposit dispute by applying an arbitrator-determined damage
+    /// deduction and returning the remainder to the tenant.
+    ///
+    /// # Parameters
+    /// - `lease_id`         – ID of the disputed lease.
+    /// - `arbitrator`       – Must be present in `lease.arbitrators`.
+    /// - `damage_deduction` – Amount to award to the landlord from the security
+    ///                        deposit.  Must satisfy
+    ///                        `0 ≤ damage_deduction ≤ security_deposit`.
+    ///
+    /// # Returns
+    /// The tenant refund amount: `security_deposit − damage_deduction`.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`]    – No lease exists for `lease_id`.
+    /// - [`LeaseError::NotAnArbitrator`]  – `arbitrator` is not in the lease's
+    ///                                      arbitrator list.
+    /// - [`LeaseError::InvalidDeduction`] – `damage_deduction` is negative or
+    ///                                      exceeds `security_deposit`.
+    ///
+    /// # Authorization
+    /// Requires `arbitrator.require_auth()`.
     pub fn resolve_dispute(
         env: Env,
         lease_id: u64,
@@ -2518,6 +2765,29 @@ impl LeaseContract {
         Ok(refund_amount)
     }
 
+    /// Executes a mutually agreed deposit settlement without arbitration.
+    ///
+    /// Both parties must sign.  The total of `return_amount + slash_amount`
+    /// must equal the full escrowed balance (`security_deposit + deposit_amount`).
+    /// Tokens are transferred immediately and the lease is archived.
+    ///
+    /// # Parameters
+    /// - `lease_id`      – ID of the target lease.
+    /// - `lessee_pubkey` – Must match the stored tenant address.
+    /// - `lessor_pubkey` – Must match the stored landlord address.
+    /// - `return_amount` – Amount to refund to the tenant. Must be `≥ 0`.
+    /// - `slash_amount`  – Amount to pay to the landlord. Must be `≥ 0`.
+    ///                     Constraint: `return_amount + slash_amount == security_deposit + deposit_amount`.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`]     – No lease exists for `lease_id`, or
+    ///                                       lease status is not `Active`/`Expired`.
+    /// - [`LeaseError::Unauthorised`]      – Address mismatch for tenant or landlord.
+    /// - [`LeaseError::InvalidReleaseMath`]– Amounts are negative or do not sum to
+    ///                                       the total escrowed balance.
+    ///
+    /// # Authorization
+    /// Requires both `lessee_pubkey.require_auth()` and `lessor_pubkey.require_auth()`.
     pub fn mutual_deposit_release(
         env: Env,
         lease_id: u64,
@@ -2601,6 +2871,30 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Initiates a mutual deposit release proposal (fallback path).
+    ///
+    /// Either party may propose terms.  The lease is moved to `Disputed` state
+    /// to freeze the deposit while the counterparty reviews.  The counterparty
+    /// must then call `mutual_deposit_release` with matching amounts to execute.
+    ///
+    /// # Parameters
+    /// - `lease_id`               – ID of the target lease.
+    /// - `initiator_pubkey`       – Must be the landlord or tenant.
+    /// - `proposed_return_amount` – Proposed refund to the tenant. Must be `≥ 0`.
+    /// - `proposed_slash_amount`  – Proposed payout to the landlord. Must be `≥ 0`.
+    ///                              Constraint: `proposed_return_amount + proposed_slash_amount
+    ///                              == security_deposit + deposit_amount`.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`]     – No lease exists for `lease_id`, or
+    ///                                       status is not `Active`/`Expired`.
+    /// - [`LeaseError::Unauthorised`]      – `initiator_pubkey` is neither landlord
+    ///                                       nor tenant.
+    /// - [`LeaseError::InvalidReleaseMath`]– Amounts are negative or do not sum to
+    ///                                       the total escrowed balance.
+    ///
+    /// # Authorization
+    /// Requires `initiator_pubkey.require_auth()`.
     pub fn init_mutual_release_fb(
         env: Env,
         lease_id: u64,
@@ -2644,6 +2938,28 @@ impl LeaseContract {
         Ok(())
     }
 
+    /// Calculates the tenant's outstanding debt and applies late fees if the
+    /// grace period has elapsed.
+    ///
+    /// This function is stateful: it updates `lease.debt`, `lease.seconds_late_charged`,
+    /// and the `FLAT_FEE_APPLIED` flag in `lease.flags`.  It emits `PaymentLate`
+    /// when fees accrue and `EvictionEligible` when total debt reaches twice the
+    /// monthly rent amount.
+    ///
+    /// # Parameters
+    /// - `lease_id` – ID of the lease to check.
+    ///
+    /// # Returns
+    /// Total outstanding debt in the lease's payment token (smallest unit).
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    ///
+    /// # Late-fee logic
+    /// - A one-time flat fee (`late_fee_flat`) is applied the first time the
+    ///   current timestamp exceeds `grace_period_end`.
+    /// - A per-second fee (`late_fee_per_sec`) accrues for every second past
+    ///   `grace_period_end` that has not yet been charged.
     pub fn check_tenant_default(env: Env, lease_id: u64) -> Result<i128, LeaseError> {
         let mut lease =
             load_lease_instance_by_id(&env, lease_id).ok_or(LeaseError::LeaseNotFound)?;
@@ -2694,6 +3010,20 @@ impl LeaseContract {
         Ok(total_debt)
     }
 
+    /// Authorises an additional payer (e.g. a roommate) to submit rent payments
+    /// on behalf of the primary tenant via `pay_lease_instance_rent`.
+    ///
+    /// # Parameters
+    /// - `lease_id`  – ID of the target lease.
+    /// - `landlord`  – Must match the stored landlord address.
+    /// - `roommate`  – Address to authorise as a co-payer.
+    ///
+    /// # Errors
+    /// - [`LeaseError::LeaseNotFound`] – No lease exists for `lease_id`.
+    /// - [`LeaseError::Unauthorised`]  – `landlord` does not match the stored landlord.
+    ///
+    /// # Authorization
+    /// Requires `landlord.require_auth()`.
     pub fn add_authorized_payer(
         env: Env,
         lease_id: u64,
