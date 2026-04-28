@@ -1001,11 +1001,192 @@ mod nft_contract {
 }
 
 mod token_contract {
-    use soroban_sdk::{contractclient, Address, Env};
+    use soroban_sdk::{contractclient, Address, Env, Vec};
     #[contractclient(name = "TokenClient")]
     pub trait TokenInterface {
         fn transfer(env: Env, from: Address, to: Address, amount: i128);
+        fn balance(env: Env, account: Address) -> i128;
+        fn allowance(env: Env, from: Address, spender: Address) -> i128;
     }
+}
+
+// Reentrancy protection functions
+fn enter_reentrancy_guard(env: &Env) -> Result<(), LeaseError> {
+    let is_locked: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::ReentrancyGuard)
+        .unwrap_or(false);
+    
+    if is_locked {
+        return Err(LeaseError::FlashLoanAttemptBlocked); // Reuse error for reentrancy
+    }
+    
+    env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+    Ok(())
+}
+
+fn exit_reentrancy_guard(env: &Env) {
+    env.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+}
+
+// Safe token transfer helper functions with reentrancy protection
+fn safe_transfer_with_balance_check(
+    env: &Env,
+    token: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> Result<(), LeaseError> {
+    // Pre-transfer balance checks
+    require!(amount >= 0, "Transfer amount must be non-negative");
+    
+    let token_client = token_contract::TokenClient::new(env, token);
+    let from_balance = token_client.balance(from);
+    let to_balance = token_client.balance(to);
+    
+    // Ensure sender has sufficient balance
+    require!(from_balance >= amount, "Insufficient balance for transfer");
+    require!(from_balance >= 0, "Sender balance is negative");
+    require!(to_balance >= 0, "Recipient balance is negative");
+    
+    // Check allowance if not transferring from contract
+    if from != &env.current_contract_address() {
+        let allowance = token_client.allowance(from, &env.current_contract_address());
+        require!(allowance >= amount, "Insufficient allowance for transfer");
+        require!(allowance >= 0, "Allowance is negative");
+    }
+    
+    // Perform the transfer
+    token_client.transfer(from, to, amount);
+    
+    // Post-transfer verification
+    let new_from_balance = token_client.balance(from);
+    let new_to_balance = token_client.balance(to);
+    
+    // Verify balances are still non-negative
+    require!(new_from_balance >= 0, "Post-transfer sender balance is negative");
+    require!(new_to_balance >= 0, "Post-transfer recipient balance is negative");
+    
+    // Verify transfer was successful (within reasonable bounds)
+    require!(
+        new_from_balance <= from_balance,
+        "Sender balance increased after transfer"
+    );
+    require!(
+        new_to_balance >= to_balance,
+        "Recipient balance decreased after transfer"
+    );
+    
+    Ok(())
+}
+
+fn safe_transfer_with_reentrancy_guard(
+    env: &Env,
+    token: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> Result<(), LeaseError> {
+    // Enter reentrancy guard
+    enter_reentrancy_guard(env)?;
+    
+    // Perform safe transfer
+    let result = safe_transfer_with_balance_check(env, token, from, to, amount);
+    
+    // Always exit reentrancy guard
+    exit_reentrancy_guard(env);
+    
+    result
+}
+
+// Panic recovery helper functions
+fn get_panic_recovery_state(env: &Env) -> PanicRecoveryState {
+    env.storage()
+        .instance()
+        .get(&DataKey::PanicRecoveryState)
+        .unwrap_or(PanicRecoveryState {
+            failed_operations: soroban_sdk::Vec::new(env),
+            recovery_enabled: false,
+            admin_override: None,
+        })
+}
+
+fn save_panic_recovery_state(env: &Env, state: &PanicRecoveryState) {
+    env.storage().instance().set(&DataKey::PanicRecoveryState, state);
+}
+
+fn record_failed_refund(env: &Env, attempt: &RefundAttempt) {
+    env.storage().persistent().set(&DataKey::FailedRefund(attempt.lease_id), attempt);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::FailedRefund(attempt.lease_id), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+fn load_failed_refund(env: &Env, lease_id: u64) -> Option<RefundAttempt> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::FailedRefund(lease_id))
+}
+
+fn remove_failed_refund(env: &Env, lease_id: u64) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::FailedRefund(lease_id));
+}
+
+// Safe multi-asset refund with panic recovery
+fn safe_multi_asset_refund(
+    env: &Env,
+    lease_id: u64,
+    refunds: &soroban_sdk::Vec<(Address, Address, i128)>, // (token, recipient, amount)
+) -> Result<(), LeaseError> {
+    let mut successful_refunds = soroban_sdk::Vec::new(env);
+    let mut failed_refunds = soroban_sdk::Vec::new(env);
+    
+    // Attempt each refund
+    for (token, recipient, amount) in refunds.iter() {
+        let refund_attempt = RefundAttempt {
+            lease_id,
+            recipient: recipient.clone(),
+            token: token.clone(),
+            amount: *amount,
+            attempt_timestamp: env.ledger().timestamp(),
+            success: false,
+            failure_reason: None,
+        };
+        
+        match safe_transfer_with_reentrancy_guard(env, token, &env.current_contract_address(), recipient, *amount) {
+            Ok(()) => {
+                let mut success_attempt = refund_attempt;
+                success_attempt.success = true;
+                successful_refunds.push_back(success_attempt);
+            }
+            Err(e) => {
+                let mut failed_attempt = refund_attempt;
+                failed_attempt.success = false;
+                failed_attempt.failure_reason = Some(String::from_str(env, "Token transfer failed"));
+                failed_refunds.push_back(failed_attempt);
+                record_failed_refund(env, &failed_attempt);
+            }
+        }
+    }
+    
+    // If any refunds failed, enable panic recovery mode
+    if !failed_refunds.is_empty() {
+        let mut recovery_state = get_panic_recovery_state(env);
+        recovery_state.recovery_enabled = true;
+        
+        // Add failed operations to recovery state
+        for failed_refund in failed_refunds.iter() {
+            recovery_state.failed_operations.push_back(failed_refund.clone());
+        }
+        
+        save_panic_recovery_state(env, &recovery_state);
+        return Err(LeaseError::TokenTransferFailed);
+    }
+    
+    Ok(())
 }
 
 mod kyc_contract {
@@ -2347,6 +2528,11 @@ impl LeaseContract {
         }
         landlord.require_auth();
 
+        // Apply granular authorization for partial deductions
+        if damage_deduction > 0 {
+            validate_partial_deduction(&env, lease_id, damage_deduction, landlord)?;
+        }
+
         if damage_deduction < 0 || damage_deduction > lease.deposit_amount {
             return Err(LeaseError::InvalidDeduction);
         }
@@ -2568,6 +2754,15 @@ impl LeaseContract {
             return Err(LeaseError::NotAnArbitrator);
         }
         arbitrator.require_auth();
+
+        // Apply granular authorization for partial deductions
+        if damage_deduction > 0 {
+            // For arbitrators, we allow higher deductions but require justification
+            let max_arbitrator_deduction = lease.security_deposit * 7500 as i128 / 10_000; // 75% max
+            if damage_deduction > max_arbitrator_deduction {
+                return Err(LeaseError::ExcessivePartialDeduction);
+            }
+        }
 
         if damage_deduction < 0 || damage_deduction > lease.security_deposit {
             return Err(LeaseError::InvalidDeduction);
@@ -2805,6 +3000,133 @@ impl LeaseContract {
         }
         .publish(&env);
         Ok(())
+    }
+    
+    /// Retry failed refunds from panic recovery
+    pub fn retry_failed_refunds(
+        env: Env,
+        lease_id: u64,
+        caller: Address,
+    ) -> Result<(), LeaseError> {
+        caller.require_auth();
+        
+        let recovery_state = get_panic_recovery_state(&env);
+        if !recovery_state.recovery_enabled {
+            return Err(LeaseError::PanicRecoveryMode);
+        }
+        
+        // Check if caller is admin or authorized
+        if let Some(admin) = recovery_state.admin_override {
+            if caller != admin {
+                return Err(LeaseError::Unauthorised);
+            }
+        } else {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        let failed_refund = load_failed_refund(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        if failed_refund.success {
+            return Err(LeaseError::RefundAlreadyProcessed);
+        }
+        
+        // Retry the transfer
+        match safe_transfer_with_reentrancy_guard(
+            &env,
+            &failed_refund.token,
+            &env.current_contract_address(),
+            &failed_refund.recipient,
+            failed_refund.amount,
+        ) {
+            Ok(()) => {
+                // Success - remove from failed refunds
+                remove_failed_refund(&env, lease_id);
+                
+                // Update recovery state
+                let mut updated_state = recovery_state;
+                // Remove from failed operations
+                let mut new_failed_ops = soroban_sdk::Vec::new(&env);
+                for op in updated_state.failed_operations.iter() {
+                    if op.lease_id != lease_id {
+                        new_failed_ops.push_back(op.clone());
+                    }
+                }
+                updated_state.failed_operations = new_failed_ops;
+                
+                // Disable recovery if no more failed operations
+                if updated_state.failed_operations.is_empty() {
+                    updated_state.recovery_enabled = false;
+                    updated_state.admin_override = None;
+                }
+                
+                save_panic_recovery_state(&env, &updated_state);
+                Ok(())
+            }
+            Err(e) => {
+                // Still failed - update failure reason and timestamp
+                let mut updated_attempt = failed_refund;
+                updated_attempt.attempt_timestamp = env.ledger().timestamp();
+                updated_attempt.failure_reason = Some(String::from_str(&env, "Retry failed"));
+                record_failed_refund(&env, &updated_attempt);
+                Err(e)
+            }
+        }
+    }
+    
+    /// Get panic recovery status
+    pub fn get_panic_recovery_status(env: Env) -> Result<PanicRecoveryState, LeaseError> {
+        Ok(get_panic_recovery_state(&env))
+    }
+    
+    /// Process multi-asset security deposit refund with panic recovery
+    pub fn process_multi_asset_refund(
+        env: Env,
+        lease_id: u64,
+        refund_tokens: soroban_sdk::Vec<Address>,
+        refund_amounts: soroban_sdk::Vec<i128>,
+        recipient: Address,
+    ) -> Result<(), LeaseError> {
+        recipient.require_auth();
+        
+        let lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Verify lease is terminated and deposit is settled
+        if lease.status != LeaseStatus::Terminated || lease.deposit_status != DepositStatus::Settled {
+            return Err(LeaseError::LeaseNotExpired);
+        }
+        
+        // Verify recipient is tenant
+        if recipient != lease.tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        // Check if already refunded
+        if load_failed_refund(&env, lease_id).is_some() {
+            return Err(LeaseError::RefundAlreadyProcessed);
+        }
+        
+        // Validate input lengths match
+        if refund_tokens.len() != refund_amounts.len() {
+            return Err(LeaseError::InvalidDeduction);
+        }
+        
+        // Create refund tuples
+        let mut refunds = soroban_sdk::Vec::new(&env);
+        for i in 0..refund_tokens.len() {
+            let token = refund_tokens.get(i).unwrap();
+            let amount = refund_amounts.get(i).unwrap();
+            
+            if *amount <= 0 {
+                continue; // Skip zero amounts
+            }
+            
+            refunds.push_back((token.clone(), recipient.clone(), *amount));
+        }
+        
+        // Process refunds with panic recovery
+        safe_multi_asset_refund(&env, lease_id, &refunds)
     }
 
     pub fn upgrade(
@@ -4394,6 +4716,9 @@ impl LeaseContract {
 }
 
 mod test;
+pub mod rent_escalation;
+#[cfg(test)]
+mod rent_escalation_tests;
 mod upgrade_tests;
 mod oracle_fallback_tests;
 mod asset_metadata_tests;
