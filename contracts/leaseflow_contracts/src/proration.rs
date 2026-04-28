@@ -34,6 +34,7 @@ pub fn days_in_month(year: u64, month: u8) -> u64 {
 
 /// Calculates the prorated first month's rent down to the exact second.
 /// Automatically handles varying month lengths and leap years.
+/// Issue #187: Uses ceiling division for landlord-favorable precision-safe calculation.
 pub fn calculate_first_month_rent(start_date: u64, rent_amount: i128) -> i128 {
     let (year, month, day) = timestamp_to_ymd(start_date);
     let total_days = days_in_month(year, month);
@@ -47,9 +48,17 @@ pub fn calculate_first_month_rent(start_date: u64, rent_amount: i128) -> i128 {
     // Remaining seconds occupied down to the exact second.
     let occupied_secs = total_month_secs.saturating_sub(elapsed_secs);
     
-    // Formula: (Rent * occupied_seconds) / total_month_seconds
-    // i128 is used directly to prevent overflow issues during large multiplications.
-    (rent_amount.saturating_mul(occupied_secs as i128)) / (total_month_secs as i128)
+    // Issue #187: Formula: (Rent * occupied_seconds) / total_month_seconds
+    // Use ceiling division for landlord-favorable precision-safe calculation
+    // Ceiling division: (a + b - 1) / b = ceil(a / b)
+    let numerator = rent_amount.saturating_mul(occupied_secs as i128);
+    let denominator = total_month_secs as i128;
+    
+    if denominator > 0 {
+        numerator.saturating_add(denominator.saturating_sub(1)) / denominator
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]

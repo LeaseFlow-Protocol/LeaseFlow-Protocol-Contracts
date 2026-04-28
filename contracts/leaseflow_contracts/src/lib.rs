@@ -13,6 +13,12 @@ use soroban_sdk::{
 mod velocity_guard;
 use velocity_guard::VelocityGuard;
 
+mod division_safety;
+use division_safety::DivisionSafety;
+
+mod wear_tear_precision;
+use wear_tear_precision::WearTearCalculator;
+
 mod lease_creation_rate_limit;
 use lease_creation_rate_limit::LeaseCreationRateLimit;
 
@@ -2194,7 +2200,7 @@ impl LeaseContract {
         // Check velocity limits before allowing termination
         VelocityGuard::check_velocity_limits(&env, &lease.landlord)?;
 
-        // Calculate early termination penalty
+        // Calculate early termination penalty with precision-safe calculations (Issue #187)
         let current_time = env.ledger().timestamp();
         let total_duration = lease.end_date - lease.start_date;
         let elapsed_time = current_time - lease.start_date;
@@ -2205,16 +2211,22 @@ impl LeaseContract {
             // If both are configured, use the higher amount
             let percentage_penalty = if fee_bps > 0 && remaining_time > 0 {
                 let remaining_value = remaining_time as i128 * lease.rent_per_sec;
-                remaining_value * fee_bps as i128 / 10_000
+                // Issue #187: Use precision-safe ceiling division for landlord-favorable calculation
+                let mut calc = WearTearCalculator::new();
+                calc.calculate_percentage_deduction_ceiling(remaining_value, fee_bps)
+                    .unwrap_or(0)
             } else {
                 0
             };
             percentage_penalty.max(fixed_penalty)
         } else if let Some(fee_bps) = lease.early_termination_fee_bps {
-            // Percentage-based penalty
+            // Percentage-based penalty with precision-safe calculation
             if fee_bps > 0 && remaining_time > 0 {
                 let remaining_value = remaining_time as i128 * lease.rent_per_sec;
-                remaining_value * fee_bps as i128 / 10_000
+                // Issue #187: Use precision-safe ceiling division for landlord-favorable calculation
+                let mut calc = WearTearCalculator::new();
+                calc.calculate_percentage_deduction_ceiling(remaining_value, fee_bps)
+                    .unwrap_or(0)
             } else {
                 0
             }
@@ -3505,10 +3517,17 @@ impl LeaseContract {
 
         let total_deposit = lease.security_deposit + lease.deposit_amount;
         let penalty_percentage = Self::calculate_penalty_percentage(payload.damage_severity);
+        
+        // Issue #187: Use precision-safe calculation for wear and tear deductions
         let penalty_amount = if penalty_percentage == 0 {
             0
         } else {
-            total_deposit.saturating_mul(penalty_percentage as i128) / 100
+            let mut calc = WearTearCalculator::new();
+            // Convert percentage to BPS (multiply by 100) and use ceiling division
+            calc.calculate_percentage_deduction_ceiling(
+                total_deposit,
+                penalty_percentage * 100,
+            ).unwrap_or(0)
         };
 
         let tenant_refund = total_deposit.saturating_sub(penalty_amount);
@@ -4270,10 +4289,14 @@ impl LeaseContract {
         // LeaseInstance does not carry fee_bps / fixed_penalty fields yet, so
         // we fall back to a proportional penalty: remaining_rent_value * 10 %
         // as a sensible default that matches the production path.
+        // Issue #187: Use precision-safe ceiling division for landlord-favorable calculation
         let penalty_amount = if remaining_time > 0 && lease.rent_per_sec > 0 {
             let remaining_value = remaining_time as i128 * lease.rent_per_sec;
             // 10 % early-termination penalty (1000 bps) – mirrors execute_early_termination default
-            (remaining_value * 1_000 / 10_000).min(total_deposit)
+            let mut calc = WearTearCalculator::new();
+            calc.calculate_percentage_deduction_ceiling(remaining_value, 1_000)
+                .unwrap_or(0)
+                .min(total_deposit)
         } else {
             0
         };
@@ -4391,3 +4414,7 @@ pub mod expired_proposals;
 // Issue #131: Performance Stress Test — 500 Concurrent Lease Actions
 #[cfg(test)]
 mod stress_tests;
+
+// Issue #187: Precision-safe wear and tear calculation tests
+#[cfg(test)]
+mod wear_tear_precision_tests;
