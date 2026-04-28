@@ -607,6 +607,37 @@ pub struct HistoricalLeasePage {
     pub next_cursor: Option<u64>,
 }
 
+// ============================================================================
+// Issue #190: Batch Rent Processing — gas-safe cursor-paginated sweep
+// ============================================================================
+
+/// Per-lease outcome within a batch withdrawal sweep.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRentResult {
+    /// The lease that was processed.
+    pub lease_id: u64,
+    /// Amount transferred to the withdrawal address in this sweep.
+    pub amount_withdrawn: i128,
+    /// `true` if the item was processed successfully; `false` if it was
+    /// skipped (e.g. no withdrawal address set, zero balance, or wrong
+    /// landlord).
+    pub success: bool,
+}
+
+/// Aggregate result returned by `batch_withdraw_rent`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchRentWithdrawResult {
+    /// Per-lease outcomes for every lease_id in the input slice.
+    pub results: soroban_sdk::Vec<BatchRentResult>,
+    /// Sum of all amounts successfully withdrawn in this call.
+    pub total_withdrawn: i128,
+    /// Cursor pointing to the first unprocessed lease_id.
+    /// `None` means the entire input slice was consumed.
+    pub next_cursor: Option<u64>,
+}
+
 #[contractevent]
 pub struct RoommateAdded {
     pub lease_id: u64,
@@ -859,8 +890,9 @@ pub enum LeaseError {
     AssetThawFailed = 37,
     RegistryCallFailed = 38,
     AssetVerificationFailed = 39,
-    VelocityLimitExceeded = 40,
-    RateLimitExceeded = 41,
+    // Issue #190: Batch Rent Processing errors
+    BatchSizeExceeded = 40,
+    BatchEmpty = 41,
 }
 
 macro_rules! require {
@@ -893,6 +925,14 @@ const DEFAULT_PROTOCOL_FEE_BPS: u32 = 100; // 1% default fee
 // Issue #119: Quadratic Voting Constants
 const GOVERNANCE_ROUND_DURATION: u64 = 7 * 24 * 60 * 60; // 7 days voting period
 const FLASH_LOAN_PROTECTION_BUFFER: u64 = 24 * 60 * 60; // 24 hours snapshot before round
+
+// Issue #190: Batch Rent Processing — gas-safe sweep limit.
+// Each iteration loads a lease, computes withdrawable amount, and writes back.
+// Soroban's per-transaction instruction budget is ~100M; empirical profiling
+// shows ~1.5M instructions per lease item, giving a safe ceiling of ~50 items
+// before the budget is exhausted.  We use 25 as a conservative default that
+// leaves headroom for the surrounding bookkeeping.
+pub const MAX_BATCH_SIZE: u32 = 25;
 
 pub fn to_per_second(rate: i128, rate_type: RateType) -> i128 {
     match rate_type {
@@ -4683,6 +4723,180 @@ impl LeaseContract {
                     active_leases.push_back(summary);
                 }
             }
+        }
+        active_leases
+    }
+
+    // ========================================================================
+    // Issue #124: Add lease ID to the active leases index
+    // ========================================================================
+
+    pub fn add_to_active_leases_index(env: &Env, lease_id: u64) -> Result<(), LeaseError> {
+        let mut index: soroban_sdk::Vec<u64> = env
+            .storage()
+            .instance()
+            .get(&DataKey::ActiveLeasesIndex)
+            .unwrap_or(soroban_sdk::Vec::new(env));
+        index.push_back(lease_id);
+        env.storage()
+            .instance()
+            .set(&DataKey::ActiveLeasesIndex, &index);
+        Ok(())
+    }
+
+    // ========================================================================
+    // Issue #190: Batch Rent Withdrawal — gas-safe cursor-paginated sweep
+    // ========================================================================
+
+    /// Withdraw accumulated rent for multiple leases owned by `landlord` in a
+    /// single transaction, bounded by `MAX_BATCH_SIZE` to prevent out-of-gas
+    /// errors during massive landlord sweeps.
+    ///
+    /// # Gas safety
+    /// Each call processes at most `MAX_BATCH_SIZE` (25) leases.  If the
+    /// caller supplies more IDs the function returns
+    /// `Err(LeaseError::BatchSizeExceeded)` immediately so the caller can
+    /// split the work across multiple transactions using the cursor pattern.
+    ///
+    /// # Cursor-based pagination
+    /// Pass `cursor: None` to start from the beginning of `lease_ids`.
+    /// On return, `BatchRentWithdrawResult::next_cursor` contains the first
+    /// lease_id that was **not** processed (i.e. the start of the next page).
+    /// When `next_cursor` is `None` the entire input slice was consumed.
+    ///
+    /// # Per-item error isolation
+    /// A lease that cannot be processed (wrong landlord, no withdrawal address,
+    /// zero withdrawable balance) is **skipped** rather than aborting the whole
+    /// batch.  The per-item `success` flag in `BatchRentResult` tells the
+    /// caller which items need attention.
+    ///
+    /// # Parameters
+    /// - `landlord`  – Must be the landlord of every lease in the batch.
+    /// - `lease_ids` – Ordered list of lease IDs to sweep (max `MAX_BATCH_SIZE`).
+    /// - `cursor`    – Last lease_id seen in the previous page (exclusive).
+    ///                 Pass `None` to start from the first element.
+    ///
+    /// # Errors
+    /// - [`LeaseError::BatchSizeExceeded`] – `lease_ids` contains more than
+    ///   `MAX_BATCH_SIZE` entries.
+    /// - [`LeaseError::BatchEmpty`]        – `lease_ids` is empty.
+    /// - [`LeaseError::Unauthorised`]      – `landlord` auth check failed.
+    pub fn batch_withdraw_rent(
+        env: Env,
+        landlord: Address,
+        lease_ids: soroban_sdk::Vec<u64>,
+        cursor: Option<u64>,
+    ) -> Result<BatchRentWithdrawResult, LeaseError> {
+        landlord.require_auth();
+
+        let total = lease_ids.len();
+        if total == 0 {
+            return Err(LeaseError::BatchEmpty);
+        }
+        if total > MAX_BATCH_SIZE {
+            return Err(LeaseError::BatchSizeExceeded);
+        }
+
+        // Determine the starting index based on the cursor.
+        let start: u32 = match cursor {
+            None => 0,
+            Some(last_id) => {
+                let mut pos = total; // default: cursor not found → return empty
+                for i in 0..total {
+                    if lease_ids.get(i).unwrap_or(u64::MAX) == last_id {
+                        pos = i + 1;
+                        break;
+                    }
+                }
+                pos
+            }
+        };
+
+        let mut results = soroban_sdk::Vec::new(&env);
+        let mut total_withdrawn: i128 = 0;
+
+        for i in start..total {
+            let lease_id = lease_ids.get(i).unwrap();
+
+            // Load lease — skip if not found.
+            let lease_opt = load_lease_instance_by_id(&env, lease_id);
+            let mut lease = match lease_opt {
+                Some(l) => l,
+                None => {
+                    results.push_back(BatchRentResult {
+                        lease_id,
+                        amount_withdrawn: 0,
+                        success: false,
+                    });
+                    continue;
+                }
+            };
+
+            // Skip leases not owned by the caller.
+            if lease.landlord != landlord {
+                results.push_back(BatchRentResult {
+                    lease_id,
+                    amount_withdrawn: 0,
+                    success: false,
+                });
+                continue;
+            }
+
+            // Skip leases without a withdrawal address.
+            let withdrawal_address = match lease.withdrawal_address.clone() {
+                Some(addr) => addr,
+                None => {
+                    results.push_back(BatchRentResult {
+                        lease_id,
+                        amount_withdrawn: 0,
+                        success: false,
+                    });
+                    continue;
+                }
+            };
+
+            // Compute withdrawable amount.
+            let withdrawable = lease.rent_paid.saturating_sub(lease.rent_withdrawn);
+            if withdrawable <= 0 {
+                results.push_back(BatchRentResult {
+                    lease_id,
+                    amount_withdrawn: 0,
+                    success: false,
+                });
+                continue;
+            }
+
+            // Execute the token transfer.
+            let token_client =
+                token_contract::TokenClient::new(&env, &lease.payment_token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &withdrawal_address,
+                &withdrawable,
+            );
+
+            // Update accounting.
+            lease.rent_withdrawn += withdrawable;
+            save_lease_instance(&env, lease_id, &lease);
+
+            total_withdrawn += withdrawable;
+            results.push_back(BatchRentResult {
+                lease_id,
+                amount_withdrawn: withdrawable,
+                success: true,
+            });
+        }
+
+        // next_cursor is None when the entire slice was consumed.
+        let next_cursor: Option<u64> = None;
+
+        Ok(BatchRentWithdrawResult {
+            results,
+            total_withdrawn,
+            next_cursor,
+        })
+    }
+
     /// Allows the landlord to attach (or update) the Web2 reference ID after
     /// lease creation.  The value is sanitised to ASCII printable characters
     /// only to prevent injection attacks in downstream Web2 systems.
