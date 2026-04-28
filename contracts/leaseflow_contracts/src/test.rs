@@ -1153,3 +1153,178 @@ fn test_unauthorized_stranger_cannot_pay_rent() {
     let result = client.try_pay_lease_instance_rent(&LEASE_ID, &stranger, &1000);
     assert_eq!(result, Err(Ok(LeaseError::Unauthorised)));
 }
+
+// ============================================================================
+// Issue #190: Batch Rent Withdrawal Tests
+// ============================================================================
+
+/// Helper: seed a lease with a given rent_paid and withdrawal_address.
+fn seed_lease_with_rent(
+    env: &Env,
+    contract_id: &Address,
+    lease_id: u64,
+    landlord: &Address,
+    tenant: &Address,
+    token: &Address,
+    rent_paid: i128,
+    withdrawal_address: Option<Address>,
+) {
+    let mut lease = make_lease(env, landlord, tenant);
+    lease.payment_token = token.clone();
+    lease.rent_paid = rent_paid;
+    lease.rent_withdrawn = 0;
+    lease.withdrawal_address = withdrawal_address;
+    seed_lease(env, contract_id, lease_id, &lease);
+}
+
+/// Batch withdrawal aggregates payout across multiple leases owned by the
+/// same landlord and transfers the correct total to each withdrawal address.
+#[test]
+fn test_batch_withdraw_rent_aggregates_payout() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let withdrawal = Address::generate(&env);
+
+    let token_id = env.register(TokenMock, ());
+    let token_client = TokenMockClient::new(&env, &token_id);
+
+    // Mint enough tokens to the contract so transfers succeed.
+    token_client.mint(&contract_id, &3_000);
+
+    // Seed 3 leases, each with 1_000 rent paid and the same withdrawal address.
+    for id in 1u64..=3 {
+        seed_lease_with_rent(
+            &env,
+            &contract_id,
+            id,
+            &landlord,
+            &tenant,
+            &token_id,
+            1_000,
+            Some(withdrawal.clone()),
+        );
+    }
+
+    let lease_ids = soroban_sdk::vec![&env, 1u64, 2u64, 3u64];
+    let result = client.batch_withdraw_rent(&landlord, &lease_ids, &None);
+
+    // All three leases should have been processed successfully.
+    assert_eq!(result.total_withdrawn, 3_000);
+    assert_eq!(result.results.len(), 3);
+    for item in result.results.iter() {
+        assert!(item.success, "lease {} should succeed", item.lease_id);
+        assert_eq!(item.amount_withdrawn, 1_000);
+    }
+    assert!(result.next_cursor.is_none());
+
+    // Withdrawal address should have received the full payout.
+    assert_eq!(token_client.balance(&withdrawal), 3_000);
+
+    // rent_withdrawn should be updated on each lease.
+    for id in 1u64..=3 {
+        let lease = client.get_lease_instance(&id);
+        assert_eq!(lease.rent_withdrawn, 1_000);
+    }
+}
+
+/// Batch size exceeding MAX_BATCH_SIZE (25) must be rejected immediately.
+#[test]
+fn test_batch_withdraw_rent_exceeds_max_batch_size() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let landlord = Address::generate(&env);
+
+    // Build a Vec with 26 IDs (one over the limit).
+    let mut ids = soroban_sdk::Vec::new(&env);
+    for i in 1u64..=26 {
+        ids.push_back(i);
+    }
+
+    let result = client.try_batch_withdraw_rent(&landlord, &ids, &None);
+    assert_eq!(result, Err(Ok(LeaseError::BatchSizeExceeded)));
+}
+
+/// An empty lease_ids list must be rejected.
+#[test]
+fn test_batch_withdraw_rent_empty_list() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let landlord = Address::generate(&env);
+    let empty: soroban_sdk::Vec<u64> = soroban_sdk::Vec::new(&env);
+
+    let result = client.try_batch_withdraw_rent(&landlord, &empty, &None);
+    assert_eq!(result, Err(Ok(LeaseError::BatchEmpty)));
+}
+
+/// Leases with no withdrawal address set are skipped (success=false) without
+/// aborting the rest of the batch.
+#[test]
+fn test_batch_withdraw_rent_skips_missing_withdrawal_address() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let withdrawal = Address::generate(&env);
+    let token_id = env.register(TokenMock, ());
+    let token_client = TokenMockClient::new(&env, &token_id);
+    token_client.mint(&contract_id, &1_000);
+
+    // Lease 1: has withdrawal address.
+    seed_lease_with_rent(&env, &contract_id, 1, &landlord, &tenant, &token_id, 1_000, Some(withdrawal.clone()));
+    // Lease 2: no withdrawal address.
+    seed_lease_with_rent(&env, &contract_id, 2, &landlord, &tenant, &token_id, 500, None);
+
+    let lease_ids = soroban_sdk::vec![&env, 1u64, 2u64];
+    let result = client.batch_withdraw_rent(&landlord, &lease_ids, &None);
+
+    assert_eq!(result.total_withdrawn, 1_000);
+    assert_eq!(result.results.len(), 2);
+
+    let r0 = result.results.get(0).unwrap();
+    assert!(r0.success);
+    assert_eq!(r0.amount_withdrawn, 1_000);
+
+    let r1 = result.results.get(1).unwrap();
+    assert!(!r1.success);
+    assert_eq!(r1.amount_withdrawn, 0);
+}
+
+/// A lease with zero withdrawable balance (rent_paid == rent_withdrawn) is
+/// skipped without error.
+#[test]
+fn test_batch_withdraw_rent_skips_zero_balance() {
+    let env = make_env();
+    let (contract_id, client) = setup(&env);
+
+    let landlord = Address::generate(&env);
+    let tenant = Address::generate(&env);
+    let withdrawal = Address::generate(&env);
+    let token_id = env.register(TokenMock, ());
+    let token_client = TokenMockClient::new(&env, &token_id);
+    token_client.mint(&contract_id, &500);
+
+    // Lease 1: already fully withdrawn.
+    let mut lease1 = make_lease(&env, &landlord, &tenant);
+    lease1.payment_token = token_id.clone();
+    lease1.rent_paid = 500;
+    lease1.rent_withdrawn = 500; // nothing left
+    lease1.withdrawal_address = Some(withdrawal.clone());
+    seed_lease(&env, &contract_id, 1, &lease1);
+
+    // Lease 2: has balance.
+    seed_lease_with_rent(&env, &contract_id, 2, &landlord, &tenant, &token_id, 500, Some(withdrawal.clone()));
+
+    let lease_ids = soroban_sdk::vec![&env, 1u64, 2u64];
+    let result = client.batch_withdraw_rent(&landlord, &lease_ids, &None);
+
+    assert_eq!(result.total_withdrawn, 500);
+    let r0 = result.results.get(0).unwrap();
+    assert!(!r0.success);
+    let r1 = result.results.get(1).unwrap();
+    assert!(r1.success);
+    assert_eq!(r1.amount_withdrawn, 500);
+}
