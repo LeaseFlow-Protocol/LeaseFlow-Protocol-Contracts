@@ -4119,6 +4119,9 @@ impl LeaseContract {
 }
 
 mod test;
+pub mod rent_escalation;
+#[cfg(test)]
+mod rent_escalation_tests;
 mod upgrade_tests;
 mod oracle_fallback_tests;
 mod asset_metadata_tests;
@@ -4139,3 +4142,4 @@ pub mod expired_proposals;
 // Issue #131: Performance Stress Test — 500 Concurrent Lease Actions
 #[cfg(test)]
 mod stress_tests;
+
