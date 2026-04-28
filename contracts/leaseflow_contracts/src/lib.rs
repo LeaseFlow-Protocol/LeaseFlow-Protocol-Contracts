@@ -1340,6 +1340,16 @@ impl LeaseContract {
             .temporary()
             .remove(&DataKey::NonReentrant);
     pub fn initialize(env: Env, admin: Address) {
+        // Prevent re-initialization: once an admin is set the contract is
+        // considered initialised and any subsequent call is rejected.
+        // Without this guard any account could call initialize after deployment
+        // and take over the master property registry.
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("AlreadyInitialized");
+        }
+        // Require the designated admin to co-sign so the deployer cannot
+        // silently assign an arbitrary address as admin.
+        admin.require_auth();
         env.storage()
             .instance()
             .set(&DataKey::Admin, &admin);

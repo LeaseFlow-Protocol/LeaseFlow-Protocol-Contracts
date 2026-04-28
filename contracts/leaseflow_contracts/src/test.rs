@@ -451,6 +451,43 @@ fn test_signature_timestamp_validation() {
     assert_eq!(result_old, Err(Ok(LeaseError::InvalidSignature)));
 }
 
+// ============================================================================
+// Issue #183: Secure contract initialization
+// ============================================================================
+
+/// A second call to `initialize` must be rejected so an attacker cannot
+/// overwrite the admin and take over the master property registry.
+#[test]
+fn test_initialize_cannot_be_called_twice() {
+    let env = make_env();
+    let (_, client) = setup(&env);
+    let admin = Address::generate(&env);
+    let attacker = Address::generate(&env);
+
+    // First call succeeds.
+    client.initialize(&admin);
+
+    // Second call — even with a different address — must panic.
+    let result = std::panic::catch_unwind(|| {
+        client.initialize(&attacker);
+    });
+    assert!(result.is_err(), "re-initialization must be rejected");
+}
+
+/// `initialize` must require the admin's own signature so the deployer cannot
+/// silently assign an arbitrary address as admin.
+#[test]
+fn test_initialize_requires_admin_auth() {
+    let env = Env::default(); // no mock_all_auths
+    let contract_id = env.register(LeaseContract, ());
+    let client = LeaseContractClient::new(&env, &contract_id);
+    let admin = Address::generate(&env);
+
+    // Without the admin's auth the call must fail.
+    let result = client.try_initialize(&admin);
+    assert!(result.is_err(), "initialize without admin auth must fail");
+}
+
 #[test]
 fn test_stablecoin_enforcement() {
     let env = make_env();
