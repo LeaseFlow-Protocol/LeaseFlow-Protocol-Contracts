@@ -298,6 +298,9 @@ pub struct LeaseInstance {
     pub fixed_penalty: Option<i128>,
     // Issue #127: Webhook-compatible reference ID for Web2 backend correlation
     pub lessor_reference_id: Option<String>,
+    // --- RWA asset management fields ---
+    pub asset_registry_address: Option<Address>,
+    pub asset_id: Option<u128>,
 }
 
 #[contracttype]
@@ -353,6 +356,9 @@ pub struct CreateLeaseParams {
     pub swap_path: Vec<Address>,
     // Issue #127: Webhook-compatible reference ID for Web2 backend correlation
     pub lessor_reference_id: Option<String>,
+    // RWA asset management fields
+    pub asset_registry_address: Option<Address>,
+    pub asset_id: Option<u128>,
 }
 
 #[contracttype]
@@ -381,17 +387,22 @@ pub enum DataKey {
     OracleConfig(BytesN<32>),
     FallbackHierarchy,
     OracleFailureTimestamp(BytesN<32>),
+    // Asset management keys
+    AssetCondition(u64),
+    AssetFreezeProof(u64, Address, u128),
+    FrozenAsset(u64, Address, u128),
+    WhitelistedRegistry(Address),
     // Issue #117: Multi-Sig Veto
     SecurityCouncil,
-    PendingSlash(u64),
-    VetoVote(u64, Address),
+    PendingSlash(u64), // Temporary: 24-hour veto timelock
+    VetoVote(u64, Address), // Temporary: ephemeral during veto period
     // Issue #118: Dynamic Protocol Fees
     ProtocolFeeConfig,
-    PendingFeeUpdate,
+    PendingFeeUpdate, // Temporary: 7-day fee update timelock
     // Issue #119: Quadratic Voting
-    GovernanceRound(u64),
-    TreasuryVote(u64, Address),
-    VotingPowerSnapshot(u64, Address),
+    GovernanceRound(u64), // Temporary: 7-day voting period
+    TreasuryVote(u64, Address), // Temporary: during voting period
+    VotingPowerSnapshot(u64, Address), // Temporary: ephemeral snapshot
     // Issue #124: Active Leases Index
     ActiveLeasesIndex,
     // Issue #135: Reentrancy guard
@@ -401,9 +412,11 @@ pub enum DataKey {
     // Tiered-storage: Temporary keys for ephemeral velocity guard state
     VelocityTracker(Address),
     PausedLessor(Address),
-    DaoApprovalRequest(u64),
+    DaoApprovalRequest(u64), // Temporary: ephemeral approval requests
     // Tiered-storage: Temporary key for ephemeral oracle retry counters
     OracleRetryStats(BytesN<32>),
+    // Tiered-storage: Temporary key for oracle rate limiting (1-hour windows)
+    OracleRateLimit(BytesN<32>, u64),
 }
 
 #[contracttype]
@@ -1839,6 +1852,8 @@ impl LeaseContract {
             early_termination_fee_bps: None,
             fixed_penalty: None,
             lessor_reference_id: params.lessor_reference_id,
+            asset_registry_address: params.asset_registry_address,
+            asset_id: params.asset_id,
         };
         save_lease_instance(&env, lease_id, &lease);
 
@@ -2866,6 +2881,150 @@ impl LeaseContract {
             .remove(&DataKey::OracleRetryStats(oracle_pubkey.clone()));
     }
 
+    // ============================================================================
+    // Helper functions for ephemeral temporary storage operations
+    // ============================================================================
+
+    /// Load PendingSlashVeto from temporary storage (24-hour TTL)
+    fn get_pending_slash(env: &Env, lease_id: u64) -> Option<PendingSlashVeto> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::PendingSlash(lease_id))
+    }
+
+    /// Store PendingSlashVeto in temporary storage with 24-hour TTL
+    fn set_pending_slash(env: &Env, lease_id: u64, pending_slash: &PendingSlashVeto) {
+        let key = DataKey::PendingSlash(lease_id);
+        env.storage().temporary().set(&key, pending_slash);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 17_280, 17_280); // 24 hours at ~5s per ledger
+    }
+
+    /// Remove PendingSlashVeto from temporary storage
+    fn remove_pending_slash(env: &Env, lease_id: u64) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::PendingSlash(lease_id));
+    }
+
+    /// Load VetoVote from temporary storage (ephemeral during veto period)
+    fn get_veto_vote(env: &Env, lease_id: u64, voter: &Address) -> Option<bool> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::VetoVote(lease_id, voter.clone()))
+    }
+
+    /// Store VetoVote in temporary storage with 24-hour TTL
+    fn set_veto_vote(env: &Env, lease_id: u64, voter: &Address, voted: bool) {
+        let key = DataKey::VetoVote(lease_id, voter.clone());
+        env.storage().temporary().set(&key, &voted);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 17_280, 17_280); // 24 hours at ~5s per ledger
+    }
+
+    /// Load PendingFeeUpdate from temporary storage (7-day TTL)
+    fn get_pending_fee_update(env: &Env) -> Option<PendingFeeUpdate> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::PendingFeeUpdate)
+    }
+
+    /// Store PendingFeeUpdate in temporary storage with 7-day TTL
+    fn set_pending_fee_update(env: &Env, pending_update: &PendingFeeUpdate) {
+        let key = DataKey::PendingFeeUpdate;
+        env.storage().temporary().set(&key, pending_update);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 120_960, 120_960); // 7 days at ~5s per ledger
+    }
+
+    /// Remove PendingFeeUpdate from temporary storage
+    fn remove_pending_fee_update(env: &Env) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::PendingFeeUpdate);
+    }
+
+    /// Load GovernanceRound from temporary storage (7-day TTL)
+    fn get_governance_round(env: &Env, round_id: u64) -> Option<GovernanceRound> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::GovernanceRound(round_id))
+    }
+
+    /// Store GovernanceRound in temporary storage with 7-day TTL
+    fn set_governance_round(env: &Env, round_id: u64, round: &GovernanceRound) {
+        let key = DataKey::GovernanceRound(round_id);
+        env.storage().temporary().set(&key, round);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 120_960, 120_960); // 7 days at ~5s per ledger
+    }
+
+    /// Remove GovernanceRound from temporary storage
+    fn remove_governance_round(env: &Env, round_id: u64) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::GovernanceRound(round_id));
+    }
+
+    /// Load TreasuryVote from temporary storage (during voting period)
+    fn get_treasury_vote(env: &Env, round_id: u64, voter: &Address) -> Option<TreasuryVote> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::TreasuryVote(round_id, voter.clone()))
+    }
+
+    /// Store TreasuryVote in temporary storage with 7-day TTL
+    fn set_treasury_vote(env: &Env, round_id: u64, vote: &TreasuryVote) {
+        let key = DataKey::TreasuryVote(round_id, vote.voter.clone());
+        env.storage().temporary().set(&key, vote);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 120_960, 120_960); // 7 days at ~5s per ledger
+    }
+
+    /// Load VotingPowerSnapshot from temporary storage (ephemeral snapshot)
+    fn get_voting_power_snapshot(env: &Env, round_id: u64, voter: &Address) -> Option<i128> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::VotingPowerSnapshot(round_id, voter.clone()))
+    }
+
+    /// Store VotingPowerSnapshot in temporary storage with 7-day TTL
+    fn set_voting_power_snapshot(env: &Env, round_id: u64, voter: &Address, power: i128) {
+        let key = DataKey::VotingPowerSnapshot(round_id, voter.clone());
+        env.storage().temporary().set(&key, &power);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 120_960, 120_960); // 7 days at ~5s per ledger
+    }
+
+    /// Load DaoApprovalRequest from temporary storage (ephemeral)
+    fn get_dao_approval_request(env: &Env, request_id: u64) -> Option<bool> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::DaoApprovalRequest(request_id))
+    }
+
+    /// Store DaoApprovalRequest in temporary storage with 24-hour TTL
+    fn set_dao_approval_request(env: &Env, request_id: u64, approved: bool) {
+        let key = DataKey::DaoApprovalRequest(request_id);
+        env.storage().temporary().set(&key, &approved);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 17_280, 17_280); // 24 hours at ~5s per ledger
+    }
+
+    /// Remove DaoApprovalRequest from temporary storage
+    fn remove_dao_approval_request(env: &Env, request_id: u64) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::DaoApprovalRequest(request_id));
+    }
+
     fn get_fallback_hierarchy(env: &Env) -> Option<FallbackHierarchy> {
         env.storage()
             .instance()
@@ -3282,9 +3441,8 @@ impl LeaseContract {
                     vetoed: false,
                 };
 
-                env.storage()
-                    .instance()
-                    .set(&DataKey::PendingSlash(payload.lease_id), &pending_slash);
+                // Store in temporary storage with 24-hour TTL using helper function
+                Self::set_pending_slash(&env, payload.lease_id, &pending_slash);
 
                 // Don't execute immediately - wait for veto period
                 return Err(LeaseError::PendingVeto);
@@ -3772,7 +3930,7 @@ impl LeaseContract {
         
         // Rate limiting check (prevent spamming the registry)
         let rate_limit_key = DataKey::OracleRateLimit(payload.oracle_pubkey.clone(), current_time / 3600); // 1-hour windows
-        if env.storage().instance().has(&rate_limit_key) {
+        if env.storage().temporary().has(&rate_limit_key) {
             return Err(LeaseError::OracleStale); // Reuse existing error for rate limiting
         }
         
@@ -3818,12 +3976,13 @@ impl LeaseContract {
         );
         
         // Set rate limit for this oracle (1 update per hour maximum)
+        // Use temporary storage with 1-hour TTL (720 ledgers at ~5s per ledger)
         env.storage()
-            .instance()
+            .temporary()
             .set(&rate_limit_key, &true);
         env.storage()
-            .instance()
-            .extend_ttl(&rate_limit_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+            .temporary()
+            .extend_ttl(&rate_limit_key, 720, 720);
         
         // Update oracle nonce
         Self::set_oracle_nonce(&env, &payload.oracle_pubkey, payload.nonce);
