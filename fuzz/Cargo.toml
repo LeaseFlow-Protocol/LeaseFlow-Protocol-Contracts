@@ -36,3 +36,9 @@ path = "fuzz_targets/fuzz_timestamp_injection.rs"
 test = false
 doc = false
 
+[[bin]]
+name = "fuzz_fractional_rent_epoch_boundaries"
+path = "fuzz_targets/fuzz_fractional_rent_epoch_boundaries.rs"
+test = false
+doc = false
+
