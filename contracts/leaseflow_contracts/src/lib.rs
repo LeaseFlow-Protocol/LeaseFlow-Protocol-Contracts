@@ -224,6 +224,37 @@ pub struct CreateSubleaseParams {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositDeductionRequest {
+    pub lease_id: u64,
+    pub requester: Address,
+    pub deduction_amount: i128,
+    pub justification_hash: Option<BytesN<32>>,
+    pub request_timestamp: u64,
+    pub approval_signatures: soroban_sdk::Vec<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundAttempt {
+    pub lease_id: u64,
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+    pub attempt_timestamp: u64,
+    pub success: bool,
+    pub failure_reason: Option<String>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PanicRecoveryState {
+    pub failed_operations: soroban_sdk::Vec<RefundAttempt>,
+    pub recovery_enabled: bool,
+    pub admin_override: Option<Address>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Lease(Symbol),
     LeaseInstance(u64),
@@ -244,6 +275,11 @@ pub enum DataKey {
     JurorPool,
     SubEscrowVault(u64),
     SubLeaseCounter,
+    DepositDeductionRequest(u64),
+    DeductionApprovalThreshold,
+    ReentrancyGuard,
+    PanicRecoveryState,
+    FailedRefund(u64), // lease_id -> RefundAttempt
 }
 
 #[contracttype]
@@ -457,6 +493,12 @@ pub enum LeaseError {
     MasterLeaseNotFound = 30,
     SubEscrowVaultNotFound = 31,
     JurorReputationTooLow = 32,
+    ExcessivePartialDeduction = 33,
+    UnauthorizedPartialDeduction = 34,
+    InsufficientDeductionJustification = 35,
+    TokenTransferFailed = 36,
+    PanicRecoveryMode = 37,
+    RefundAlreadyProcessed = 38,
 }
 
 macro_rules! require {
@@ -470,6 +512,11 @@ macro_rules! require {
 const DAY_IN_LEDGERS: u32 = 17280;
 const MONTH_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 30;
 const YEAR_IN_LEDGERS: u32 = DAY_IN_LEDGERS * 365;
+
+// Security deposit deduction protection constants
+const MAX_PARTIAL_DEDUCTION_BPS: u32 = 5000; // 50% max without multi-sig
+const DEDUCTION_REQUEST_EXPIRY_LEDGERS: u64 = 50400; // ~7 days
+const DEFAULT_APPROVAL_THRESHOLD: u32 = 2; // 2-of-3 multi-sig for large deductions
 
 // Dispute resolution constants
 const DISPUTE_WINDOW_HOURS: u64 = 48;
@@ -631,6 +678,75 @@ pub fn get_next_sub_lease_id(env: &Env) -> u64 {
     next_id
 }
 
+// Granular deposit deduction authorization functions
+pub fn save_deduction_request(env: &Env, request_id: u64, request: &DepositDeductionRequest) {
+    let key = DataKey::DepositDeductionRequest(request_id);
+    env.storage().persistent().set(&key, request);
+    env.storage()
+        .persistent()
+        .extend_ttl(&key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+pub fn load_deduction_request(env: &Env, request_id: u64) -> Option<DepositDeductionRequest> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::DepositDeductionRequest(request_id))
+}
+
+pub fn get_approval_threshold(env: &Env) -> u32 {
+    env.storage()
+        .instance()
+        .get(&DataKey::DeductionApprovalThreshold)
+        .unwrap_or(DEFAULT_APPROVAL_THRESHOLD)
+}
+
+pub fn set_approval_threshold(env: &Env, admin: Address, threshold: u32) -> Result<(), LeaseError> {
+    let stored_admin: Address = env
+        .storage()
+        .instance()
+        .get(&DataKey::Admin)
+        .ok_or(LeaseError::Unauthorised)?;
+    if admin != stored_admin {
+        return Err(LeaseError::Unauthorised);
+    }
+    admin.require_auth();
+    
+    if threshold < 1 || threshold > 3 {
+        return Err(LeaseError::InvalidDeduction);
+    }
+    
+    env.storage().instance().set(&DataKey::DeductionApprovalThreshold, &threshold);
+    Ok(())
+}
+
+fn validate_partial_deduction(
+    env: &Env,
+    lease_id: u64,
+    deduction_amount: i128,
+    requester: Address,
+) -> Result<(), LeaseError> {
+    let lease = load_lease_instance_by_id(env, lease_id)
+        .ok_or(LeaseError::LeaseNotFound)?;
+    
+    // Only landlord can request deductions
+    if requester != lease.landlord {
+        return Err(LeaseError::UnauthorizedPartialDeduction);
+    }
+    
+    // Check if deduction exceeds threshold
+    let max_single_deduction = lease.security_deposit * MAX_PARTIAL_DEDUCTION_BPS as i128 / 10_000;
+    if deduction_amount > max_single_deduction {
+        return Err(LeaseError::ExcessivePartialDeduction);
+    }
+    
+    // Ensure deduction doesn't exceed total deposit
+    if deduction_amount > lease.security_deposit {
+        return Err(LeaseError::InvalidDeduction);
+    }
+    
+    Ok(())
+}
+
 // Cryptographically secure random juror selection
 pub fn select_random_jurors(env: &Env, pool: &soroban_sdk::Vec<Address>, count: u32) -> soroban_sdk::Vec<Address> {
     let mut selected = soroban_sdk::Vec::new(env);
@@ -669,11 +785,192 @@ mod nft_contract {
 }
 
 mod token_contract {
-    use soroban_sdk::{contractclient, Address, Env};
+    use soroban_sdk::{contractclient, Address, Env, Vec};
     #[contractclient(name = "TokenClient")]
     pub trait TokenInterface {
         fn transfer(env: Env, from: Address, to: Address, amount: i128);
+        fn balance(env: Env, account: Address) -> i128;
+        fn allowance(env: Env, from: Address, spender: Address) -> i128;
     }
+}
+
+// Reentrancy protection functions
+fn enter_reentrancy_guard(env: &Env) -> Result<(), LeaseError> {
+    let is_locked: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::ReentrancyGuard)
+        .unwrap_or(false);
+    
+    if is_locked {
+        return Err(LeaseError::FlashLoanAttemptBlocked); // Reuse error for reentrancy
+    }
+    
+    env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+    Ok(())
+}
+
+fn exit_reentrancy_guard(env: &Env) {
+    env.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+}
+
+// Safe token transfer helper functions with reentrancy protection
+fn safe_transfer_with_balance_check(
+    env: &Env,
+    token: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> Result<(), LeaseError> {
+    // Pre-transfer balance checks
+    require!(amount >= 0, "Transfer amount must be non-negative");
+    
+    let token_client = token_contract::TokenClient::new(env, token);
+    let from_balance = token_client.balance(from);
+    let to_balance = token_client.balance(to);
+    
+    // Ensure sender has sufficient balance
+    require!(from_balance >= amount, "Insufficient balance for transfer");
+    require!(from_balance >= 0, "Sender balance is negative");
+    require!(to_balance >= 0, "Recipient balance is negative");
+    
+    // Check allowance if not transferring from contract
+    if from != &env.current_contract_address() {
+        let allowance = token_client.allowance(from, &env.current_contract_address());
+        require!(allowance >= amount, "Insufficient allowance for transfer");
+        require!(allowance >= 0, "Allowance is negative");
+    }
+    
+    // Perform the transfer
+    token_client.transfer(from, to, amount);
+    
+    // Post-transfer verification
+    let new_from_balance = token_client.balance(from);
+    let new_to_balance = token_client.balance(to);
+    
+    // Verify balances are still non-negative
+    require!(new_from_balance >= 0, "Post-transfer sender balance is negative");
+    require!(new_to_balance >= 0, "Post-transfer recipient balance is negative");
+    
+    // Verify transfer was successful (within reasonable bounds)
+    require!(
+        new_from_balance <= from_balance,
+        "Sender balance increased after transfer"
+    );
+    require!(
+        new_to_balance >= to_balance,
+        "Recipient balance decreased after transfer"
+    );
+    
+    Ok(())
+}
+
+fn safe_transfer_with_reentrancy_guard(
+    env: &Env,
+    token: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> Result<(), LeaseError> {
+    // Enter reentrancy guard
+    enter_reentrancy_guard(env)?;
+    
+    // Perform safe transfer
+    let result = safe_transfer_with_balance_check(env, token, from, to, amount);
+    
+    // Always exit reentrancy guard
+    exit_reentrancy_guard(env);
+    
+    result
+}
+
+// Panic recovery helper functions
+fn get_panic_recovery_state(env: &Env) -> PanicRecoveryState {
+    env.storage()
+        .instance()
+        .get(&DataKey::PanicRecoveryState)
+        .unwrap_or(PanicRecoveryState {
+            failed_operations: soroban_sdk::Vec::new(env),
+            recovery_enabled: false,
+            admin_override: None,
+        })
+}
+
+fn save_panic_recovery_state(env: &Env, state: &PanicRecoveryState) {
+    env.storage().instance().set(&DataKey::PanicRecoveryState, state);
+}
+
+fn record_failed_refund(env: &Env, attempt: &RefundAttempt) {
+    env.storage().persistent().set(&DataKey::FailedRefund(attempt.lease_id), attempt);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::FailedRefund(attempt.lease_id), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+fn load_failed_refund(env: &Env, lease_id: u64) -> Option<RefundAttempt> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::FailedRefund(lease_id))
+}
+
+fn remove_failed_refund(env: &Env, lease_id: u64) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::FailedRefund(lease_id));
+}
+
+// Safe multi-asset refund with panic recovery
+fn safe_multi_asset_refund(
+    env: &Env,
+    lease_id: u64,
+    refunds: &soroban_sdk::Vec<(Address, Address, i128)>, // (token, recipient, amount)
+) -> Result<(), LeaseError> {
+    let mut successful_refunds = soroban_sdk::Vec::new(env);
+    let mut failed_refunds = soroban_sdk::Vec::new(env);
+    
+    // Attempt each refund
+    for (token, recipient, amount) in refunds.iter() {
+        let refund_attempt = RefundAttempt {
+            lease_id,
+            recipient: recipient.clone(),
+            token: token.clone(),
+            amount: *amount,
+            attempt_timestamp: env.ledger().timestamp(),
+            success: false,
+            failure_reason: None,
+        };
+        
+        match safe_transfer_with_reentrancy_guard(env, token, &env.current_contract_address(), recipient, *amount) {
+            Ok(()) => {
+                let mut success_attempt = refund_attempt;
+                success_attempt.success = true;
+                successful_refunds.push_back(success_attempt);
+            }
+            Err(e) => {
+                let mut failed_attempt = refund_attempt;
+                failed_attempt.success = false;
+                failed_attempt.failure_reason = Some(String::from_str(env, "Token transfer failed"));
+                failed_refunds.push_back(failed_attempt);
+                record_failed_refund(env, &failed_attempt);
+            }
+        }
+    }
+    
+    // If any refunds failed, enable panic recovery mode
+    if !failed_refunds.is_empty() {
+        let mut recovery_state = get_panic_recovery_state(env);
+        recovery_state.recovery_enabled = true;
+        
+        // Add failed operations to recovery state
+        for failed_refund in failed_refunds.iter() {
+            recovery_state.failed_operations.push_back(failed_refund.clone());
+        }
+        
+        save_panic_recovery_state(env, &recovery_state);
+        return Err(LeaseError::TokenTransferFailed);
+    }
+    
+    Ok(())
 }
 
 mod kyc_contract {
@@ -1286,8 +1583,9 @@ impl LeaseContract {
         ) {
             let bounty = fee_amount * BOUNTY_BPS / 10_000;
             if bounty > 0 {
-                let token = token_contract::TokenClient::new(&env, &fee_token);
-                token.transfer(&fee_recipient, &caller, &bounty);
+                // Use safe transfer with reentrancy guard and balance checks
+                safe_transfer_with_reentrancy_guard(&env, &fee_token, &fee_recipient, &caller, bounty)
+                    .map_err(|_| LeaseError::InvalidAsset)?;
                 TerminateBountyPaid { lease_id, caller: caller.clone(), amount: bounty }.publish(&env);
             }
         }
@@ -1328,6 +1626,11 @@ impl LeaseContract {
             return Err(LeaseError::Unauthorised);
         }
         landlord.require_auth();
+
+        // Apply granular authorization for partial deductions
+        if damage_deduction > 0 {
+            validate_partial_deduction(&env, lease_id, damage_deduction, landlord)?;
+        }
 
         if damage_deduction < 0 || damage_deduction > lease.deposit_amount {
             return Err(LeaseError::InvalidDeduction);
@@ -1548,6 +1851,15 @@ impl LeaseContract {
             return Err(LeaseError::NotAnArbitrator);
         }
         arbitrator.require_auth();
+
+        // Apply granular authorization for partial deductions
+        if damage_deduction > 0 {
+            // For arbitrators, we allow higher deductions but require justification
+            let max_arbitrator_deduction = lease.security_deposit * 7500 as i128 / 10_000; // 75% max
+            if damage_deduction > max_arbitrator_deduction {
+                return Err(LeaseError::ExcessivePartialDeduction);
+            }
+        }
 
         if damage_deduction < 0 || damage_deduction > lease.security_deposit {
             return Err(LeaseError::InvalidDeduction);
@@ -1770,6 +2082,11 @@ impl LeaseContract {
         // Calculate wear and tear proration
         let wear_deduction = Self::calculate_wear_proration(env.clone(), lease_id, oracle_reported_decay)?;
         
+        // Apply granular authorization for wear deductions
+        if wear_deduction > 0 {
+            validate_partial_deduction(&env, lease_id, wear_deduction, landlord)?;
+        }
+        
         // Ensure deduction doesn't exceed deposit
         let total_deduction = if wear_deduction > lease.security_deposit {
             lease.security_deposit
@@ -1784,7 +2101,129 @@ impl LeaseContract {
         Ok(lease.security_deposit - total_deduction)
     }
 
-    pub fn set_terms_hash(env: Env, admin: Address, hash: BytesN<32>) -> Result<(), LeaseError> {
+    /// Request a multi-signature deposit deduction for amounts exceeding threshold
+    pub fn request_deposit_deduction(
+        env: Env,
+        lease_id: u64,
+        landlord: Address,
+        deduction_amount: i128,
+        justification_hash: Option<BytesN<32>>,
+    ) -> Result<u64, LeaseError> {
+        landlord.require_auth();
+        
+        let lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        if landlord != lease.landlord {
+            return Err(LeaseError::UnauthorizedPartialDeduction);
+        }
+        
+        // Only allow requests for amounts exceeding single-signature threshold
+        let max_single_deduction = lease.security_deposit * MAX_PARTIAL_DEDUCTION_BPS as i128 / 10_000;
+        if deduction_amount <= max_single_deduction {
+            return Err(LeaseError::InvalidDeduction); // Use regular conclude_lease instead
+        }
+        
+        if deduction_amount > lease.security_deposit {
+            return Err(LeaseError::InvalidDeduction);
+        }
+        
+        // Generate request ID (using timestamp for uniqueness)
+        let request_id = env.ledger().timestamp();
+        
+        let request = DepositDeductionRequest {
+            lease_id,
+            requester: landlord,
+            deduction_amount,
+            justification_hash,
+            request_timestamp: env.ledger().timestamp(),
+            approval_signatures: soroban_sdk::Vec::new(&env),
+        };
+        
+        save_deduction_request(&env, request_id, &request);
+        
+        Ok(request_id)
+    }
+    
+    /// Approve a deposit deduction request (for multi-sig)
+    pub fn approve_deposit_deduction(
+        env: Env,
+        request_id: u64,
+        approver: Address,
+    ) -> Result<(), LeaseError> {
+        approver.require_auth();
+        
+        let mut request = load_deduction_request(&env, request_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        let lease = load_lease_instance_by_id(&env, request.lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Only arbitrators can approve large deductions
+        if !lease.arbitrators.contains(&approver) {
+            return Err(LeaseError::NotAnArbitrator);
+        }
+        
+        // Check if request has expired
+        let current_ledger = env.ledger().sequence() as u64;
+        let request_ledger = request.request_timestamp / 5; // Approximate ledger sequence
+        if current_ledger > request_ledger + DEDUCTION_REQUEST_EXPIRY_LEDGERS {
+            return Err(LeaseError::DisputeWindowExpired); // Reuse error for expiry
+        }
+        
+        // Check if already approved
+        if request.approval_signatures.contains(&approver) {
+            return Err(LeaseError::Unauthorised); // Already approved
+        }
+        
+        request.approval_signatures.push_back(approver);
+        save_deduction_request(&env, request_id, &request);
+        
+        Ok(())
+    }
+    
+    /// Execute a multi-signature deposit deduction
+    pub fn execute_multi_sig_deduction(
+        env: Env,
+        request_id: u64,
+        executor: Address,
+    ) -> Result<i128, LeaseError> {
+        executor.require_auth();
+        
+        let request = load_deduction_request(&env, request_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        let mut lease = load_lease_instance_by_id(&env, request.lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Only landlord or arbitrators can execute
+        if executor != lease.landlord && !lease.arbitrators.contains(&executor) {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        // Check approval threshold
+        let threshold = get_approval_threshold(&env);
+        if request.approval_signatures.len() < threshold {
+            return Err(LeaseError::InsufficientJurorVotes); // Reuse error for insufficient approvals
+        }
+        
+        // Execute deduction
+        let refund_amount = lease.security_deposit - request.deduction_amount;
+        
+        lease.status = LeaseStatus::Terminated;
+        lease.deposit_status = DepositStatus::Settled;
+        save_lease_instance(&env, request.lease_id, &lease);
+        
+        // Clean up request
+        env.storage()
+            .persistent()
+            .remove(&DataKey::DepositDeductionRequest(request_id));
+        
+        Ok(refund_amount)
+    }
+
+    /// Enable panic recovery mode for failed refunds
+    pub fn enable_panic_recovery(env: Env, admin: Address) -> Result<(), LeaseError> {
         let stored_admin: Address = env
             .storage()
             .instance()
@@ -1794,9 +2233,140 @@ impl LeaseContract {
             return Err(LeaseError::Unauthorised);
         }
         admin.require_auth();
-        env.storage().instance().set(&DataKey::TermsHash, &hash);
-        TermsHashUpdated { new_terms_hash: hash }.publish(&env);
+        
+        let mut recovery_state = get_panic_recovery_state(&env);
+        recovery_state.recovery_enabled = true;
+        recovery_state.admin_override = Some(admin);
+        save_panic_recovery_state(&env, &recovery_state);
+        
         Ok(())
+    }
+    
+    /// Retry failed refunds from panic recovery
+    pub fn retry_failed_refunds(
+        env: Env,
+        lease_id: u64,
+        caller: Address,
+    ) -> Result<(), LeaseError> {
+        caller.require_auth();
+        
+        let recovery_state = get_panic_recovery_state(&env);
+        if !recovery_state.recovery_enabled {
+            return Err(LeaseError::PanicRecoveryMode);
+        }
+        
+        // Check if caller is admin or authorized
+        if let Some(admin) = recovery_state.admin_override {
+            if caller != admin {
+                return Err(LeaseError::Unauthorised);
+            }
+        } else {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        let failed_refund = load_failed_refund(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        if failed_refund.success {
+            return Err(LeaseError::RefundAlreadyProcessed);
+        }
+        
+        // Retry the transfer
+        match safe_transfer_with_reentrancy_guard(
+            &env,
+            &failed_refund.token,
+            &env.current_contract_address(),
+            &failed_refund.recipient,
+            failed_refund.amount,
+        ) {
+            Ok(()) => {
+                // Success - remove from failed refunds
+                remove_failed_refund(&env, lease_id);
+                
+                // Update recovery state
+                let mut updated_state = recovery_state;
+                // Remove from failed operations
+                let mut new_failed_ops = soroban_sdk::Vec::new(&env);
+                for op in updated_state.failed_operations.iter() {
+                    if op.lease_id != lease_id {
+                        new_failed_ops.push_back(op.clone());
+                    }
+                }
+                updated_state.failed_operations = new_failed_ops;
+                
+                // Disable recovery if no more failed operations
+                if updated_state.failed_operations.is_empty() {
+                    updated_state.recovery_enabled = false;
+                    updated_state.admin_override = None;
+                }
+                
+                save_panic_recovery_state(&env, &updated_state);
+                Ok(())
+            }
+            Err(e) => {
+                // Still failed - update failure reason and timestamp
+                let mut updated_attempt = failed_refund;
+                updated_attempt.attempt_timestamp = env.ledger().timestamp();
+                updated_attempt.failure_reason = Some(String::from_str(&env, "Retry failed"));
+                record_failed_refund(&env, &updated_attempt);
+                Err(e)
+            }
+        }
+    }
+    
+    /// Get panic recovery status
+    pub fn get_panic_recovery_status(env: Env) -> Result<PanicRecoveryState, LeaseError> {
+        Ok(get_panic_recovery_state(&env))
+    }
+    
+    /// Process multi-asset security deposit refund with panic recovery
+    pub fn process_multi_asset_refund(
+        env: Env,
+        lease_id: u64,
+        refund_tokens: soroban_sdk::Vec<Address>,
+        refund_amounts: soroban_sdk::Vec<i128>,
+        recipient: Address,
+    ) -> Result<(), LeaseError> {
+        recipient.require_auth();
+        
+        let lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Verify lease is terminated and deposit is settled
+        if lease.status != LeaseStatus::Terminated || lease.deposit_status != DepositStatus::Settled {
+            return Err(LeaseError::LeaseNotExpired);
+        }
+        
+        // Verify recipient is tenant
+        if recipient != lease.tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        // Check if already refunded
+        if load_failed_refund(&env, lease_id).is_some() {
+            return Err(LeaseError::RefundAlreadyProcessed);
+        }
+        
+        // Validate input lengths match
+        if refund_tokens.len() != refund_amounts.len() {
+            return Err(LeaseError::InvalidDeduction);
+        }
+        
+        // Create refund tuples
+        let mut refunds = soroban_sdk::Vec::new(&env);
+        for i in 0..refund_tokens.len() {
+            let token = refund_tokens.get(i).unwrap();
+            let amount = refund_amounts.get(i).unwrap();
+            
+            if *amount <= 0 {
+                continue; // Skip zero amounts
+            }
+            
+            refunds.push_back((token.clone(), recipient.clone(), *amount));
+        }
+        
+        // Process refunds with panic recovery
+        safe_multi_asset_refund(&env, lease_id, &refunds)
     }
 
     pub fn upgrade(
