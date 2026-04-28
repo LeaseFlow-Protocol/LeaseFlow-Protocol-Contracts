@@ -13,6 +13,18 @@ use soroban_sdk::{
 mod velocity_guard;
 use velocity_guard::VelocityGuard;
 
+mod division_safety;
+use division_safety::DivisionSafety;
+
+mod wear_tear_precision;
+use wear_tear_precision::WearTearCalculator;
+
+mod lease_creation_rate_limit;
+use lease_creation_rate_limit::LeaseCreationRateLimit;
+
+mod rate_limit_admin;
+use rate_limit_admin::RateLimitAdmin;
+
 mod sep12_identity;
 pub use sep12_identity::Sep12IdentityModule;
 
@@ -27,6 +39,9 @@ mod governance_tests;
 
 #[cfg(test)]
 mod velocity_guard_tests;
+
+#[cfg(test)]
+mod lease_creation_rate_limit_tests;
 
 #[cfg(test)]
 mod derived_access_token_tests;
@@ -298,6 +313,9 @@ pub struct LeaseInstance {
     pub fixed_penalty: Option<i128>,
     // Issue #127: Webhook-compatible reference ID for Web2 backend correlation
     pub lessor_reference_id: Option<String>,
+    // --- RWA asset management fields ---
+    pub asset_registry_address: Option<Address>,
+    pub asset_id: Option<u128>,
 }
 
 #[contracttype]
@@ -353,6 +371,9 @@ pub struct CreateLeaseParams {
     pub swap_path: Vec<Address>,
     // Issue #127: Webhook-compatible reference ID for Web2 backend correlation
     pub lessor_reference_id: Option<String>,
+    // RWA asset management fields
+    pub asset_registry_address: Option<Address>,
+    pub asset_id: Option<u128>,
 }
 
 #[contracttype]
@@ -381,17 +402,22 @@ pub enum DataKey {
     OracleConfig(BytesN<32>),
     FallbackHierarchy,
     OracleFailureTimestamp(BytesN<32>),
+    // Asset management keys
+    AssetCondition(u64),
+    AssetFreezeProof(u64, Address, u128),
+    FrozenAsset(u64, Address, u128),
+    WhitelistedRegistry(Address),
     // Issue #117: Multi-Sig Veto
     SecurityCouncil,
-    PendingSlash(u64),
-    VetoVote(u64, Address),
+    PendingSlash(u64), // Temporary: 24-hour veto timelock
+    VetoVote(u64, Address), // Temporary: ephemeral during veto period
     // Issue #118: Dynamic Protocol Fees
     ProtocolFeeConfig,
-    PendingFeeUpdate,
+    PendingFeeUpdate, // Temporary: 7-day fee update timelock
     // Issue #119: Quadratic Voting
-    GovernanceRound(u64),
-    TreasuryVote(u64, Address),
-    VotingPowerSnapshot(u64, Address),
+    GovernanceRound(u64), // Temporary: 7-day voting period
+    TreasuryVote(u64, Address), // Temporary: during voting period
+    VotingPowerSnapshot(u64, Address), // Temporary: ephemeral snapshot
     // Issue #124: Active Leases Index
     ActiveLeasesIndex,
     // Issue #135: Reentrancy guard
@@ -401,9 +427,15 @@ pub enum DataKey {
     // Tiered-storage: Temporary keys for ephemeral velocity guard state
     VelocityTracker(Address),
     PausedLessor(Address),
-    DaoApprovalRequest(u64),
+    DaoApprovalRequest(u64), // Temporary: ephemeral approval requests
     // Tiered-storage: Temporary key for ephemeral oracle retry counters
     OracleRetryStats(BytesN<32>),
+    // Tiered-storage: Temporary key for oracle rate limiting (1-hour windows)
+    OracleRateLimit(BytesN<32>, u64),
+    // Issue #179: Rate limiting for lease creation to prevent DoS attacks
+    CreationRateLimit(Address),
+    RateLimitPolicy,
+    RateLimitWhitelist(Address),
 }
 
 #[contracttype]
@@ -1009,11 +1041,192 @@ mod nft_contract {
 }
 
 mod token_contract {
-    use soroban_sdk::{contractclient, Address, Env};
+    use soroban_sdk::{contractclient, Address, Env, Vec};
     #[contractclient(name = "TokenClient")]
     pub trait TokenInterface {
         fn transfer(env: Env, from: Address, to: Address, amount: i128);
+        fn balance(env: Env, account: Address) -> i128;
+        fn allowance(env: Env, from: Address, spender: Address) -> i128;
     }
+}
+
+// Reentrancy protection functions
+fn enter_reentrancy_guard(env: &Env) -> Result<(), LeaseError> {
+    let is_locked: bool = env
+        .storage()
+        .instance()
+        .get(&DataKey::ReentrancyGuard)
+        .unwrap_or(false);
+    
+    if is_locked {
+        return Err(LeaseError::FlashLoanAttemptBlocked); // Reuse error for reentrancy
+    }
+    
+    env.storage().instance().set(&DataKey::ReentrancyGuard, &true);
+    Ok(())
+}
+
+fn exit_reentrancy_guard(env: &Env) {
+    env.storage().instance().set(&DataKey::ReentrancyGuard, &false);
+}
+
+// Safe token transfer helper functions with reentrancy protection
+fn safe_transfer_with_balance_check(
+    env: &Env,
+    token: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> Result<(), LeaseError> {
+    // Pre-transfer balance checks
+    require!(amount >= 0, "Transfer amount must be non-negative");
+    
+    let token_client = token_contract::TokenClient::new(env, token);
+    let from_balance = token_client.balance(from);
+    let to_balance = token_client.balance(to);
+    
+    // Ensure sender has sufficient balance
+    require!(from_balance >= amount, "Insufficient balance for transfer");
+    require!(from_balance >= 0, "Sender balance is negative");
+    require!(to_balance >= 0, "Recipient balance is negative");
+    
+    // Check allowance if not transferring from contract
+    if from != &env.current_contract_address() {
+        let allowance = token_client.allowance(from, &env.current_contract_address());
+        require!(allowance >= amount, "Insufficient allowance for transfer");
+        require!(allowance >= 0, "Allowance is negative");
+    }
+    
+    // Perform the transfer
+    token_client.transfer(from, to, amount);
+    
+    // Post-transfer verification
+    let new_from_balance = token_client.balance(from);
+    let new_to_balance = token_client.balance(to);
+    
+    // Verify balances are still non-negative
+    require!(new_from_balance >= 0, "Post-transfer sender balance is negative");
+    require!(new_to_balance >= 0, "Post-transfer recipient balance is negative");
+    
+    // Verify transfer was successful (within reasonable bounds)
+    require!(
+        new_from_balance <= from_balance,
+        "Sender balance increased after transfer"
+    );
+    require!(
+        new_to_balance >= to_balance,
+        "Recipient balance decreased after transfer"
+    );
+    
+    Ok(())
+}
+
+fn safe_transfer_with_reentrancy_guard(
+    env: &Env,
+    token: &Address,
+    from: &Address,
+    to: &Address,
+    amount: i128,
+) -> Result<(), LeaseError> {
+    // Enter reentrancy guard
+    enter_reentrancy_guard(env)?;
+    
+    // Perform safe transfer
+    let result = safe_transfer_with_balance_check(env, token, from, to, amount);
+    
+    // Always exit reentrancy guard
+    exit_reentrancy_guard(env);
+    
+    result
+}
+
+// Panic recovery helper functions
+fn get_panic_recovery_state(env: &Env) -> PanicRecoveryState {
+    env.storage()
+        .instance()
+        .get(&DataKey::PanicRecoveryState)
+        .unwrap_or(PanicRecoveryState {
+            failed_operations: soroban_sdk::Vec::new(env),
+            recovery_enabled: false,
+            admin_override: None,
+        })
+}
+
+fn save_panic_recovery_state(env: &Env, state: &PanicRecoveryState) {
+    env.storage().instance().set(&DataKey::PanicRecoveryState, state);
+}
+
+fn record_failed_refund(env: &Env, attempt: &RefundAttempt) {
+    env.storage().persistent().set(&DataKey::FailedRefund(attempt.lease_id), attempt);
+    env.storage()
+        .persistent()
+        .extend_ttl(&DataKey::FailedRefund(attempt.lease_id), YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+}
+
+fn load_failed_refund(env: &Env, lease_id: u64) -> Option<RefundAttempt> {
+    env.storage()
+        .persistent()
+        .get(&DataKey::FailedRefund(lease_id))
+}
+
+fn remove_failed_refund(env: &Env, lease_id: u64) {
+    env.storage()
+        .persistent()
+        .remove(&DataKey::FailedRefund(lease_id));
+}
+
+// Safe multi-asset refund with panic recovery
+fn safe_multi_asset_refund(
+    env: &Env,
+    lease_id: u64,
+    refunds: &soroban_sdk::Vec<(Address, Address, i128)>, // (token, recipient, amount)
+) -> Result<(), LeaseError> {
+    let mut successful_refunds = soroban_sdk::Vec::new(env);
+    let mut failed_refunds = soroban_sdk::Vec::new(env);
+    
+    // Attempt each refund
+    for (token, recipient, amount) in refunds.iter() {
+        let refund_attempt = RefundAttempt {
+            lease_id,
+            recipient: recipient.clone(),
+            token: token.clone(),
+            amount: *amount,
+            attempt_timestamp: env.ledger().timestamp(),
+            success: false,
+            failure_reason: None,
+        };
+        
+        match safe_transfer_with_reentrancy_guard(env, token, &env.current_contract_address(), recipient, *amount) {
+            Ok(()) => {
+                let mut success_attempt = refund_attempt;
+                success_attempt.success = true;
+                successful_refunds.push_back(success_attempt);
+            }
+            Err(e) => {
+                let mut failed_attempt = refund_attempt;
+                failed_attempt.success = false;
+                failed_attempt.failure_reason = Some(String::from_str(env, "Token transfer failed"));
+                failed_refunds.push_back(failed_attempt);
+                record_failed_refund(env, &failed_attempt);
+            }
+        }
+    }
+    
+    // If any refunds failed, enable panic recovery mode
+    if !failed_refunds.is_empty() {
+        let mut recovery_state = get_panic_recovery_state(env);
+        recovery_state.recovery_enabled = true;
+        
+        // Add failed operations to recovery state
+        for failed_refund in failed_refunds.iter() {
+            recovery_state.failed_operations.push_back(failed_refund.clone());
+        }
+        
+        save_panic_recovery_state(env, &recovery_state);
+        return Err(LeaseError::TokenTransferFailed);
+    }
+    
+    Ok(())
 }
 
 mod kyc_contract {
@@ -1301,6 +1514,10 @@ impl LeaseContract {
         landlord.require_auth();
         Self::require_kyc(&env, &landlord, &tenant)?;
         Self::require_stablecoin(&env, &payment_token)?;
+        
+        // Issue #179: Rate limiting for lease creation
+        LeaseCreationRateLimit::initialize_address(&env, &landlord)?;
+        LeaseCreationRateLimit::check_creation_limits(&env, &landlord)?;
         let lease_id = symbol_short!("lease");
         let lease = Lease {
             landlord,
@@ -1327,6 +1544,10 @@ impl LeaseContract {
             payment_token,
         };
         env.storage().instance().set(&lease_id, &lease);
+        
+        // Issue #179: Record lease creation for rate tracking
+        LeaseCreationRateLimit::record_creation(&env, &landlord)?;
+        
         Ok(lease_id)
     }
 
@@ -1346,6 +1567,10 @@ impl LeaseContract {
         landlord.require_auth();
         Self::require_kyc(&env, &landlord, &tenant)?;
         Self::require_stablecoin(&env, &payment_token)?;
+        
+        // Issue #179: Rate limiting for lease creation
+        LeaseCreationRateLimit::initialize_address(&env, &landlord)?;
+        LeaseCreationRateLimit::check_creation_limits(&env, &landlord)?;
         
         let current_time = env.ledger().timestamp();
         let lease_id = env.ledger().sequence();
@@ -1431,6 +1656,9 @@ impl LeaseContract {
             rate: rent_per_second,
         }
         .publish(&env);
+        
+        // Issue #179: Record lease creation for rate tracking
+        LeaseCreationRateLimit::record_creation(&env, &landlord)?;
         
         Ok(lease_id)
     }
@@ -1793,6 +2021,10 @@ impl LeaseContract {
         }
         landlord.require_auth();
         params.tenant.require_auth();
+        
+        // Issue #179: Rate limiting for lease creation
+        LeaseCreationRateLimit::initialize_address(&env, &landlord)?;
+        LeaseCreationRateLimit::check_creation_limits(&env, &landlord)?;
 
         // RWA Asset Verification - Required if registry address is provided
         let (freeze_proof, ownership_verified) = if let (Some(registry_address), Some(asset_id)) = 
@@ -1881,6 +2113,8 @@ impl LeaseContract {
             early_termination_fee_bps: None,
             fixed_penalty: None,
             lessor_reference_id: params.lessor_reference_id,
+            asset_registry_address: params.asset_registry_address,
+            asset_id: params.asset_id,
         };
         save_lease_instance(&env, lease_id, &lease);
 
@@ -1902,6 +2136,10 @@ impl LeaseContract {
             property_hash: params.property_uri,
         }
         .publish(&env);
+        
+        // Issue #179: Record lease creation for rate tracking
+        LeaseCreationRateLimit::record_creation(&env, &landlord)?;
+        
         Ok(())
     }
 
@@ -2183,7 +2421,7 @@ impl LeaseContract {
         // Check velocity limits before allowing termination
         VelocityGuard::check_velocity_limits(&env, &lease.landlord)?;
 
-        // Calculate early termination penalty
+        // Calculate early termination penalty with precision-safe calculations (Issue #187)
         let current_time = env.ledger().timestamp();
         let total_duration = lease.end_date - lease.start_date;
         let elapsed_time = current_time - lease.start_date;
@@ -2194,16 +2432,22 @@ impl LeaseContract {
             // If both are configured, use the higher amount
             let percentage_penalty = if fee_bps > 0 && remaining_time > 0 {
                 let remaining_value = remaining_time as i128 * lease.rent_per_sec;
-                remaining_value * fee_bps as i128 / 10_000
+                // Issue #187: Use precision-safe ceiling division for landlord-favorable calculation
+                let mut calc = WearTearCalculator::new();
+                calc.calculate_percentage_deduction_ceiling(remaining_value, fee_bps)
+                    .unwrap_or(0)
             } else {
                 0
             };
             percentage_penalty.max(fixed_penalty)
         } else if let Some(fee_bps) = lease.early_termination_fee_bps {
-            // Percentage-based penalty
+            // Percentage-based penalty with precision-safe calculation
             if fee_bps > 0 && remaining_time > 0 {
                 let remaining_value = remaining_time as i128 * lease.rent_per_sec;
-                remaining_value * fee_bps as i128 / 10_000
+                // Issue #187: Use precision-safe ceiling division for landlord-favorable calculation
+                let mut calc = WearTearCalculator::new();
+                calc.calculate_percentage_deduction_ceiling(remaining_value, fee_bps)
+                    .unwrap_or(0)
             } else {
                 0
             }
@@ -2323,6 +2567,11 @@ impl LeaseContract {
             return Err(LeaseError::Unauthorised);
         }
         landlord.require_auth();
+
+        // Apply granular authorization for partial deductions
+        if damage_deduction > 0 {
+            validate_partial_deduction(&env, lease_id, damage_deduction, landlord)?;
+        }
 
         if damage_deduction < 0 || damage_deduction > lease.deposit_amount {
             return Err(LeaseError::InvalidDeduction);
@@ -2545,6 +2794,15 @@ impl LeaseContract {
             return Err(LeaseError::NotAnArbitrator);
         }
         arbitrator.require_auth();
+
+        // Apply granular authorization for partial deductions
+        if damage_deduction > 0 {
+            // For arbitrators, we allow higher deductions but require justification
+            let max_arbitrator_deduction = lease.security_deposit * 7500 as i128 / 10_000; // 75% max
+            if damage_deduction > max_arbitrator_deduction {
+                return Err(LeaseError::ExcessivePartialDeduction);
+            }
+        }
 
         if damage_deduction < 0 || damage_deduction > lease.security_deposit {
             return Err(LeaseError::InvalidDeduction);
@@ -2783,6 +3041,133 @@ impl LeaseContract {
         .publish(&env);
         Ok(())
     }
+    
+    /// Retry failed refunds from panic recovery
+    pub fn retry_failed_refunds(
+        env: Env,
+        lease_id: u64,
+        caller: Address,
+    ) -> Result<(), LeaseError> {
+        caller.require_auth();
+        
+        let recovery_state = get_panic_recovery_state(&env);
+        if !recovery_state.recovery_enabled {
+            return Err(LeaseError::PanicRecoveryMode);
+        }
+        
+        // Check if caller is admin or authorized
+        if let Some(admin) = recovery_state.admin_override {
+            if caller != admin {
+                return Err(LeaseError::Unauthorised);
+            }
+        } else {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        let failed_refund = load_failed_refund(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        if failed_refund.success {
+            return Err(LeaseError::RefundAlreadyProcessed);
+        }
+        
+        // Retry the transfer
+        match safe_transfer_with_reentrancy_guard(
+            &env,
+            &failed_refund.token,
+            &env.current_contract_address(),
+            &failed_refund.recipient,
+            failed_refund.amount,
+        ) {
+            Ok(()) => {
+                // Success - remove from failed refunds
+                remove_failed_refund(&env, lease_id);
+                
+                // Update recovery state
+                let mut updated_state = recovery_state;
+                // Remove from failed operations
+                let mut new_failed_ops = soroban_sdk::Vec::new(&env);
+                for op in updated_state.failed_operations.iter() {
+                    if op.lease_id != lease_id {
+                        new_failed_ops.push_back(op.clone());
+                    }
+                }
+                updated_state.failed_operations = new_failed_ops;
+                
+                // Disable recovery if no more failed operations
+                if updated_state.failed_operations.is_empty() {
+                    updated_state.recovery_enabled = false;
+                    updated_state.admin_override = None;
+                }
+                
+                save_panic_recovery_state(&env, &updated_state);
+                Ok(())
+            }
+            Err(e) => {
+                // Still failed - update failure reason and timestamp
+                let mut updated_attempt = failed_refund;
+                updated_attempt.attempt_timestamp = env.ledger().timestamp();
+                updated_attempt.failure_reason = Some(String::from_str(&env, "Retry failed"));
+                record_failed_refund(&env, &updated_attempt);
+                Err(e)
+            }
+        }
+    }
+    
+    /// Get panic recovery status
+    pub fn get_panic_recovery_status(env: Env) -> Result<PanicRecoveryState, LeaseError> {
+        Ok(get_panic_recovery_state(&env))
+    }
+    
+    /// Process multi-asset security deposit refund with panic recovery
+    pub fn process_multi_asset_refund(
+        env: Env,
+        lease_id: u64,
+        refund_tokens: soroban_sdk::Vec<Address>,
+        refund_amounts: soroban_sdk::Vec<i128>,
+        recipient: Address,
+    ) -> Result<(), LeaseError> {
+        recipient.require_auth();
+        
+        let lease = load_lease_instance_by_id(&env, lease_id)
+            .ok_or(LeaseError::LeaseNotFound)?;
+        
+        // Verify lease is terminated and deposit is settled
+        if lease.status != LeaseStatus::Terminated || lease.deposit_status != DepositStatus::Settled {
+            return Err(LeaseError::LeaseNotExpired);
+        }
+        
+        // Verify recipient is tenant
+        if recipient != lease.tenant {
+            return Err(LeaseError::Unauthorised);
+        }
+        
+        // Check if already refunded
+        if load_failed_refund(&env, lease_id).is_some() {
+            return Err(LeaseError::RefundAlreadyProcessed);
+        }
+        
+        // Validate input lengths match
+        if refund_tokens.len() != refund_amounts.len() {
+            return Err(LeaseError::InvalidDeduction);
+        }
+        
+        // Create refund tuples
+        let mut refunds = soroban_sdk::Vec::new(&env);
+        for i in 0..refund_tokens.len() {
+            let token = refund_tokens.get(i).unwrap();
+            let amount = refund_amounts.get(i).unwrap();
+            
+            if *amount <= 0 {
+                continue; // Skip zero amounts
+            }
+            
+            refunds.push_back((token.clone(), recipient.clone(), *amount));
+        }
+        
+        // Process refunds with panic recovery
+        safe_multi_asset_refund(&env, lease_id, &refunds)
+    }
 
     pub fn upgrade(
         env: Env,
@@ -2856,6 +3241,61 @@ impl LeaseContract {
         Ok(())
     }
 
+    // Issue #179: Rate limit admin functions
+    
+    /// Get the current rate limit policy
+    pub fn get_rate_limit_policy(env: Env) -> crate::rate_limit_admin::RateLimitPolicy {
+        RateLimitAdmin::get_policy(&env)
+    }
+
+    /// Update rate limit policy (admin only)
+    pub fn update_rate_limit_policy(
+        env: Env,
+        admin: Address,
+        max_per_hour: u32,
+        max_per_day: u32,
+        rate_limit_duration: u64,
+    ) -> Result<(), LeaseError> {
+        RateLimitAdmin::update_policy(&env, &admin, max_per_hour, max_per_day, rate_limit_duration)
+    }
+
+    /// Toggle rate limiting on/off (admin only)
+    pub fn toggle_rate_limiting(env: Env, admin: Address, enabled: bool) -> Result<(), LeaseError> {
+        RateLimitAdmin::toggle_rate_limiting(&env, &admin, enabled)
+    }
+
+    /// Check if an address is whitelisted from rate limits
+    pub fn is_rate_limit_whitelisted(env: Env, address: Address) -> bool {
+        RateLimitAdmin::is_whitelisted(&env, &address)
+    }
+
+    /// Add address to rate limit whitelist (admin only)
+    pub fn whitelist_rate_limit_address(
+        env: Env,
+        admin: Address,
+        address: Address,
+        reason: String,
+    ) -> Result<(), LeaseError> {
+        RateLimitAdmin::whitelist_address(&env, &admin, &address, reason)
+    }
+
+    /// Remove address from rate limit whitelist (admin only)
+    pub fn remove_rate_limit_whitelist(
+        env: Env,
+        admin: Address,
+        address: Address,
+    ) -> Result<(), LeaseError> {
+        RateLimitAdmin::remove_from_whitelist(&env, &admin, &address)
+    }
+
+    /// Get whitelist entry for a specific address
+    pub fn get_rate_limit_whitelist_entry(
+        env: Env,
+        address: Address,
+    ) -> Option<crate::rate_limit_admin::WhitelistedAddress> {
+        RateLimitAdmin::get_whitelist_entry(&env, &address)
+    }
+
     fn is_oracle_whitelisted(env: &Env, oracle_pubkey: &BytesN<32>) -> bool {
         env.storage()
             .instance()
@@ -2906,6 +3346,150 @@ impl LeaseContract {
         env.storage()
             .temporary()
             .remove(&DataKey::OracleRetryStats(oracle_pubkey.clone()));
+    }
+
+    // ============================================================================
+    // Helper functions for ephemeral temporary storage operations
+    // ============================================================================
+
+    /// Load PendingSlashVeto from temporary storage (24-hour TTL)
+    fn get_pending_slash(env: &Env, lease_id: u64) -> Option<PendingSlashVeto> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::PendingSlash(lease_id))
+    }
+
+    /// Store PendingSlashVeto in temporary storage with 24-hour TTL
+    fn set_pending_slash(env: &Env, lease_id: u64, pending_slash: &PendingSlashVeto) {
+        let key = DataKey::PendingSlash(lease_id);
+        env.storage().temporary().set(&key, pending_slash);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 17_280, 17_280); // 24 hours at ~5s per ledger
+    }
+
+    /// Remove PendingSlashVeto from temporary storage
+    fn remove_pending_slash(env: &Env, lease_id: u64) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::PendingSlash(lease_id));
+    }
+
+    /// Load VetoVote from temporary storage (ephemeral during veto period)
+    fn get_veto_vote(env: &Env, lease_id: u64, voter: &Address) -> Option<bool> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::VetoVote(lease_id, voter.clone()))
+    }
+
+    /// Store VetoVote in temporary storage with 24-hour TTL
+    fn set_veto_vote(env: &Env, lease_id: u64, voter: &Address, voted: bool) {
+        let key = DataKey::VetoVote(lease_id, voter.clone());
+        env.storage().temporary().set(&key, &voted);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 17_280, 17_280); // 24 hours at ~5s per ledger
+    }
+
+    /// Load PendingFeeUpdate from temporary storage (7-day TTL)
+    fn get_pending_fee_update(env: &Env) -> Option<PendingFeeUpdate> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::PendingFeeUpdate)
+    }
+
+    /// Store PendingFeeUpdate in temporary storage with 7-day TTL
+    fn set_pending_fee_update(env: &Env, pending_update: &PendingFeeUpdate) {
+        let key = DataKey::PendingFeeUpdate;
+        env.storage().temporary().set(&key, pending_update);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 120_960, 120_960); // 7 days at ~5s per ledger
+    }
+
+    /// Remove PendingFeeUpdate from temporary storage
+    fn remove_pending_fee_update(env: &Env) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::PendingFeeUpdate);
+    }
+
+    /// Load GovernanceRound from temporary storage (7-day TTL)
+    fn get_governance_round(env: &Env, round_id: u64) -> Option<GovernanceRound> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::GovernanceRound(round_id))
+    }
+
+    /// Store GovernanceRound in temporary storage with 7-day TTL
+    fn set_governance_round(env: &Env, round_id: u64, round: &GovernanceRound) {
+        let key = DataKey::GovernanceRound(round_id);
+        env.storage().temporary().set(&key, round);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 120_960, 120_960); // 7 days at ~5s per ledger
+    }
+
+    /// Remove GovernanceRound from temporary storage
+    fn remove_governance_round(env: &Env, round_id: u64) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::GovernanceRound(round_id));
+    }
+
+    /// Load TreasuryVote from temporary storage (during voting period)
+    fn get_treasury_vote(env: &Env, round_id: u64, voter: &Address) -> Option<TreasuryVote> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::TreasuryVote(round_id, voter.clone()))
+    }
+
+    /// Store TreasuryVote in temporary storage with 7-day TTL
+    fn set_treasury_vote(env: &Env, round_id: u64, vote: &TreasuryVote) {
+        let key = DataKey::TreasuryVote(round_id, vote.voter.clone());
+        env.storage().temporary().set(&key, vote);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 120_960, 120_960); // 7 days at ~5s per ledger
+    }
+
+    /// Load VotingPowerSnapshot from temporary storage (ephemeral snapshot)
+    fn get_voting_power_snapshot(env: &Env, round_id: u64, voter: &Address) -> Option<i128> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::VotingPowerSnapshot(round_id, voter.clone()))
+    }
+
+    /// Store VotingPowerSnapshot in temporary storage with 7-day TTL
+    fn set_voting_power_snapshot(env: &Env, round_id: u64, voter: &Address, power: i128) {
+        let key = DataKey::VotingPowerSnapshot(round_id, voter.clone());
+        env.storage().temporary().set(&key, &power);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 120_960, 120_960); // 7 days at ~5s per ledger
+    }
+
+    /// Load DaoApprovalRequest from temporary storage (ephemeral)
+    fn get_dao_approval_request(env: &Env, request_id: u64) -> Option<bool> {
+        env.storage()
+            .temporary()
+            .get(&DataKey::DaoApprovalRequest(request_id))
+    }
+
+    /// Store DaoApprovalRequest in temporary storage with 24-hour TTL
+    fn set_dao_approval_request(env: &Env, request_id: u64, approved: bool) {
+        let key = DataKey::DaoApprovalRequest(request_id);
+        env.storage().temporary().set(&key, &approved);
+        env.storage()
+            .temporary()
+            .extend_ttl(&key, 17_280, 17_280); // 24 hours at ~5s per ledger
+    }
+
+    /// Remove DaoApprovalRequest from temporary storage
+    fn remove_dao_approval_request(env: &Env, request_id: u64) {
+        env.storage()
+            .temporary()
+            .remove(&DataKey::DaoApprovalRequest(request_id));
     }
 
     fn get_fallback_hierarchy(env: &Env) -> Option<FallbackHierarchy> {
@@ -3295,10 +3879,17 @@ impl LeaseContract {
 
         let total_deposit = lease.security_deposit + lease.deposit_amount;
         let penalty_percentage = Self::calculate_penalty_percentage(payload.damage_severity);
+        
+        // Issue #187: Use precision-safe calculation for wear and tear deductions
         let penalty_amount = if penalty_percentage == 0 {
             0
         } else {
-            total_deposit.saturating_mul(penalty_percentage as i128) / 100
+            let mut calc = WearTearCalculator::new();
+            // Convert percentage to BPS (multiply by 100) and use ceiling division
+            calc.calculate_percentage_deduction_ceiling(
+                total_deposit,
+                penalty_percentage * 100,
+            ).unwrap_or(0)
         };
 
         let tenant_refund = total_deposit.saturating_sub(penalty_amount);
@@ -3324,9 +3915,8 @@ impl LeaseContract {
                     vetoed: false,
                 };
 
-                env.storage()
-                    .instance()
-                    .set(&DataKey::PendingSlash(payload.lease_id), &pending_slash);
+                // Store in temporary storage with 24-hour TTL using helper function
+                Self::set_pending_slash(&env, payload.lease_id, &pending_slash);
 
                 // Don't execute immediately - wait for veto period
                 return Err(LeaseError::PendingVeto);
@@ -3814,7 +4404,7 @@ impl LeaseContract {
         
         // Rate limiting check (prevent spamming the registry)
         let rate_limit_key = DataKey::OracleRateLimit(payload.oracle_pubkey.clone(), current_time / 3600); // 1-hour windows
-        if env.storage().instance().has(&rate_limit_key) {
+        if env.storage().temporary().has(&rate_limit_key) {
             return Err(LeaseError::OracleStale); // Reuse existing error for rate limiting
         }
         
@@ -3860,12 +4450,13 @@ impl LeaseContract {
         );
         
         // Set rate limit for this oracle (1 update per hour maximum)
+        // Use temporary storage with 1-hour TTL (720 ledgers at ~5s per ledger)
         env.storage()
-            .instance()
+            .temporary()
             .set(&rate_limit_key, &true);
         env.storage()
-            .instance()
-            .extend_ttl(&rate_limit_key, YEAR_IN_LEDGERS, YEAR_IN_LEDGERS);
+            .temporary()
+            .extend_ttl(&rate_limit_key, 720, 720);
         
         // Update oracle nonce
         Self::set_oracle_nonce(&env, &payload.oracle_pubkey, payload.nonce);
@@ -4060,10 +4651,14 @@ impl LeaseContract {
         // LeaseInstance does not carry fee_bps / fixed_penalty fields yet, so
         // we fall back to a proportional penalty: remaining_rent_value * 10 %
         // as a sensible default that matches the production path.
+        // Issue #187: Use precision-safe ceiling division for landlord-favorable calculation
         let penalty_amount = if remaining_time > 0 && lease.rent_per_sec > 0 {
             let remaining_value = remaining_time as i128 * lease.rent_per_sec;
             // 10 % early-termination penalty (1000 bps) – mirrors execute_early_termination default
-            (remaining_value * 1_000 / 10_000).min(total_deposit)
+            let mut calc = WearTearCalculator::new();
+            calc.calculate_percentage_deduction_ceiling(remaining_value, 1_000)
+                .unwrap_or(0)
+                .min(total_deposit)
         } else {
             0
         };
@@ -4335,6 +4930,9 @@ impl LeaseContract {
 }
 
 mod test;
+pub mod rent_escalation;
+#[cfg(test)]
+mod rent_escalation_tests;
 mod upgrade_tests;
 mod oracle_fallback_tests;
 mod asset_metadata_tests;
@@ -4355,3 +4953,7 @@ pub mod expired_proposals;
 // Issue #131: Performance Stress Test — 500 Concurrent Lease Actions
 #[cfg(test)]
 mod stress_tests;
+
+// Issue #187: Precision-safe wear and tear calculation tests
+#[cfg(test)]
+mod wear_tear_precision_tests;
