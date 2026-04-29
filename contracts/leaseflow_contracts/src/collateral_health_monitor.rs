@@ -604,17 +604,38 @@ impl CollateralHealthMonitor {
         paused_utilities.contains_key(&lessee)
     }
 
-    /// Batch health check for gas efficiency
+    /// Batch health check for gas efficiency with bounded iteration
     pub fn batch_health_check(env: Env, lease_ids: Vec<u64>) -> Result<Vec<u64>, CollateralHealthError> {
         let mut problematic_leases = Vec::new(&env);
+        let mut iteration_count = 0u32;
+        
+        // Validate batch size limit
+        let batch_size = lease_ids.len() as u32;
+        if let Err(_) = crate::iteration_limits::IterationController::validate_batch_operations(batch_size) {
+            return Err(CollateralHealthError::BatchSizeExceeded);
+        }
+        
+        let max_iterations = crate::iteration_limits::IterationController::get_limits().max_batch_operations;
         
         for lease_id in lease_ids.iter() {
+            if iteration_count >= max_iterations {
+                // Emit warning and break if limit reached
+                crate::iteration_limits::IterationUtils::emit_iteration_warning(
+                    &env, 
+                    "batch_health_check", 
+                    iteration_count, 
+                    max_iterations
+                );
+                break;
+            }
+            
             match Self::check_collateral_health(env.clone(), lease_id) {
                 Ok(_) => {},
                 Err(_) => {
                     problematic_leases.push_back(lease_id);
                 }
             }
+            iteration_count += 1;
         }
         
         Ok(problematic_leases)

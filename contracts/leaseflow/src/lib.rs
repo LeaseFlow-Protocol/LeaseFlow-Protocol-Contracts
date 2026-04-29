@@ -2,6 +2,10 @@
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, env, symbol, Address, Bytes, Symbol, Vec, Map, U256, i64, u64};
 use leaseflow_math::{calculate_prorated_rent, calculate_termination_refund};
 
+// Bounded iteration limits for security
+mod iteration_limits;
+use iteration_limits::{IterationController, IterationLimitError};
+
 // Issue #179: Rate limiting for lease creation
 mod lease_creation_rate_limit;
 use lease_creation_rate_limit::LeaseCreationRateLimit;
@@ -66,6 +70,8 @@ pub enum Error {
     OracleCallFailed = 18,
     InvalidFiatPegConfig = 19,
     RateLimitExceeded = 20,
+    UserLeasesLimitExceeded = 21,
+    AssociatedLeaseIdsLimitExceeded = 22,
     // Multi-signature validation errors
     MultiSigNotInitialized = 21,
     InvalidSignatory = 22,
@@ -1034,18 +1040,39 @@ impl LeaseFlowContract {
         data.leases.get(lease_id).ok_or(Error::LeaseNotFound)
     }
 
-    // Get all leases for a specific address (either lessor or lessee)
-    pub fn get_user_leases(env: env::Env, user: Address) -> Vec<u64> {
+    // Get all leases for a specific address (either lessor or lessee) with bounded iteration
+    pub fn get_user_leases(env: env::Env, user: Address) -> Result<Vec<u64>, Error> {
         let data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
         let mut user_leases = Vec::new(&env);
+        let mut iteration_count = 0u32;
 
+        // Validate iteration limit before processing
+        let total_leases = data.leases.len() as u32;
+        if let Err(_) = IterationController::validate_user_leases_iteration(total_leases) {
+            return Err(Error::UserLeasesLimitExceeded);
+        }
+
+        // Bounded iteration through leases
         for (lease_id, lease) in data.leases {
+            if iteration_count >= IterationController::get_limits().max_user_leases {
+                // Emit warning and break if limit reached
+                iteration_limits::IterationUtils::emit_iteration_warning(
+                    &env, 
+                    "get_user_leases", 
+                    iteration_count, 
+                    IterationController::get_limits().max_user_leases
+                );
+                break;
+            }
+
             if lease.lessor == user || lease.lessee == user {
                 user_leases.push_back(lease_id);
             }
+            
+            iteration_count += 1;
         }
 
-        user_leases
+        Ok(user_leases)
     }
 
     // Execute automated security deposit deduction for rent arrears
@@ -1127,7 +1154,7 @@ impl LeaseFlowContract {
         Ok(total_arrears)
     }
 
-    // Update or create credit record for residual debt
+    // Update or create credit record for residual debt with bounded iteration
     fn update_credit_record(
         env: &env::Env,
         data: &mut ContractData, 
@@ -1145,14 +1172,43 @@ impl LeaseFlowContract {
             associated_lease_ids: Vec::new(env),
         });
 
+        // Validate associated lease IDs limit
+        if let Err(_) = IterationController::validate_associated_lease_ids(record.associated_lease_ids.len() as u32) {
+            return Err(Error::AssociatedLeaseIdsLimitExceeded);
+        }
+
         // Update record with new debt
         record.total_debt_amount += residual_debt;
         record.default_count += 1;
         record.last_default_timestamp = current_timestamp;
         
-        // Add lease ID if not already present
-        if !record.associated_lease_ids.contains(&lease_id) {
+        // Add lease ID if not already present (with bounded search)
+        let mut lease_exists = false;
+        let mut search_count = 0u32;
+        let max_search = IterationController::get_limits().max_associated_lease_ids;
+        
+        for existing_lease_id in record.associated_lease_ids.iter() {
+            if search_count >= max_search {
+                break;
+            }
+            
+            if existing_lease_id == lease_id {
+                lease_exists = true;
+                break;
+            }
+            search_count += 1;
+        }
+        
+        if !lease_exists && record.associated_lease_ids.len() < max_search as u32 {
             record.associated_lease_ids.push_back(lease_id);
+        } else if !lease_exists {
+            // Emit warning if we can't add more lease IDs
+            iteration_limits::IterationUtils::emit_iteration_warning(
+                env, 
+                "update_credit_record", 
+                record.associated_lease_ids.len() as u32, 
+                max_search
+            );
         }
 
         data.credit_records.set(lessee, record);

@@ -10,6 +10,10 @@ use soroban_sdk::{
     BytesN, Env, String, Symbol, Vec,
 };
 
+// Bounded iteration limits for security
+mod iteration_limits;
+use iteration_limits::{IterationController, IterationLimitError};
+
 mod velocity_guard;
 use velocity_guard::VelocityGuard;
 
@@ -924,6 +928,11 @@ pub enum LeaseError {
     // Issue #190: Batch Rent Processing errors
     BatchSizeExceeded = 40,
     BatchEmpty = 41,
+    // Bounded iteration limit errors
+    ActiveLeasesLimitExceeded = 42,
+    BatchOperationsLimitExceeded = 43,
+    VelocityTrackingLimitExceeded = 44,
+    ApprovalEntriesLimitExceeded = 45,
 }
 
 macro_rules! require {
@@ -5178,21 +5187,41 @@ impl LeaseContract {
     // Issue #127: Set lessor_reference_id on an existing lease
     // ========================================================================
 
-    pub fn get_active_leases(env: Env) -> soroban_sdk::Vec<ActiveLeaseSummary> {
+    pub fn get_active_leases(env: Env) -> Result<soroban_sdk::Vec<ActiveLeaseSummary>, LeaseError> {
         // This is a read-only function - no state mutations
-        // Returns comprehensive lease data for frontend rendering
+        // Returns comprehensive lease data for frontend rendering with bounded iteration
 
         let mut active_leases = soroban_sdk::Vec::new(&env);
+        let mut iteration_count = 0u32;
 
-        // Iterate through lease instances (in production, this would use an index)
-        // For optimization, we maintain an ActiveLeasesIndex
+        // Get lease IDs from ActiveLeasesIndex
         let lease_ids: soroban_sdk::Vec<u64> = env
             .storage()
             .instance()
             .get(&DataKey::ActiveLeasesIndex)
             .unwrap_or(soroban_sdk::Vec::new(&env));
 
+        // Validate iteration limit before processing
+        let total_leases = lease_ids.len() as u32;
+        if let Err(_) = IterationController::validate_active_leases_iteration(total_leases) {
+            return Err(LeaseError::ActiveLeasesLimitExceeded);
+        }
+
+        // Bounded iteration through lease IDs
+        let max_iterations = IterationController::get_limits().max_active_leases;
+        
         for lease_id in lease_ids.iter() {
+            if iteration_count >= max_iterations {
+                // Emit warning and break if limit reached
+                iteration_limits::IterationUtils::emit_iteration_warning(
+                    &env, 
+                    "get_active_leases", 
+                    iteration_count, 
+                    max_iterations
+                );
+                break;
+            }
+
             if let Ok(lease) = Self::get_lease_instance(env.clone(), lease_id) {
                 // Only return active leases
                 if lease.flags & lease_flags::ACTIVE != 0
@@ -5222,8 +5251,11 @@ impl LeaseContract {
                     active_leases.push_back(summary);
                 }
             }
+            
+            iteration_count += 1;
         }
-        active_leases
+        
+        Ok(active_leases)
     }
 
     // ========================================================================
