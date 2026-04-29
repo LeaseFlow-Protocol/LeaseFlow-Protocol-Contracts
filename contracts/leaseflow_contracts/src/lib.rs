@@ -52,6 +52,12 @@ mod derived_access_token_tests;
 mod mock_rwa_registry;
 
 #[cfg(test)]
+mod safe_math_128_tests;
+
+#[cfg(test)]
+mod performance_benchmarks;
+
+#[cfg(test)]
 mod rwa_registry_tests;
 
 #[contracttype]
@@ -79,6 +85,7 @@ pub enum LeaseStatus {
     Disputed,
     Terminated,
     DaoArbitration,
+    Defaulted,
 }
 
 #[contracttype]
@@ -604,6 +611,14 @@ pub struct ActiveLeaseSummary {
     pub active: bool,
     pub yield_delegation_enabled: bool,
     pub equity_percentage_bps: u32,
+}
+
+#[contractevent]
+pub struct LeaseStateTransition {
+    pub lease_id: u64,
+    pub old_status: LeaseStatus,
+    pub new_status: LeaseStatus,
+    pub timestamp: u64,
 }
 
 // Issue #126: Read-only termination simulation result
@@ -1827,9 +1842,11 @@ impl LeaseContract {
     }
 
     pub fn extend_ttl(env: Env, _lease_id: Symbol) {
+        // Optimized: Only bump if less than 1 week remains, reducing write fees
+        const WEEK_IN_LEDGERS: u32 = 120_960; 
         env.storage()
             .instance()
-            .extend_ttl(MONTH_IN_LEDGERS, YEAR_IN_LEDGERS);
+            .extend_ttl(WEEK_IN_LEDGERS, YEAR_IN_LEDGERS);
     }
 
     pub fn check_usage_rights(
@@ -2165,6 +2182,13 @@ impl LeaseContract {
         };
         save_lease_instance(&env, lease_id, &lease);
 
+        LeaseStateTransition {
+            lease_id,
+            old_status: LeaseStatus::Pending,
+            new_status: LeaseStatus::Pending,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
+
         // Add to active leases index for optimized querying (Issue #124)
         let idx_result = Self::add_to_active_leases_index(&env, lease_id);
         // Initialize velocity tracker for landlord and update portfolio size
@@ -2287,6 +2311,14 @@ impl LeaseContract {
 
         if let Some(buyout_price) = lease.buyout_price {
             if lease.cumulative_payments >= buyout_price {
+                let old_status = lease.status.clone();
+                LeaseStateTransition {
+                    lease_id,
+                    old_status,
+                    new_status: LeaseStatus::Terminated,
+                    timestamp: env.ledger().timestamp(),
+                }.publish(&env);
+
                 lease.flags &= !lease_flags::ACTIVE;
                 lease.status = LeaseStatus::Terminated;
                 if let (Some(nft), Some(id)) = (&lease.nft_contract, &lease.token_id) {
@@ -2418,6 +2450,14 @@ impl LeaseContract {
         {
             return Err(LeaseError::DepositNotSettled);
         }
+
+        let old_status = lease.status.clone();
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
 
         const BOUNTY_BPS: i128 = 1_000;
         if let (Some(fee_amount), Some(fee_token), Some(fee_recipient)) = (
@@ -2564,9 +2604,17 @@ impl LeaseContract {
         }
 
         // Update lease status
+        let old_status = lease.status.clone();
         lease.status = LeaseStatus::Terminated;
         lease.deposit_status = DepositStatus::Settled;
         lease.flags &= !lease_flags::ACTIVE;
+
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: current_time,
+        }.publish(&env);
 
         // Handle NFT if present
         if let (Some(nft_contract), Some(token_id)) = 
@@ -2684,6 +2732,14 @@ impl LeaseContract {
         if damage_deduction > 0 {
             validate_partial_deduction(&env, lease_id, damage_deduction, landlord)?;
         }
+
+        let old_status = lease.status.clone();
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
 
         if damage_deduction < 0 || damage_deduction > lease.deposit_amount {
             return Err(LeaseError::InvalidDeduction);
@@ -2861,6 +2917,14 @@ impl LeaseContract {
             );
         }
 
+        let old_status = lease.status.clone();
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
+
         lease.status = LeaseStatus::Terminated;
         lease.flags &= !lease_flags::ACTIVE;
 
@@ -3010,8 +3074,17 @@ impl LeaseContract {
         }
         caller.require_auth();
 
+        let old_status = lease.status.clone();
         lease.deposit_status = DepositStatus::Disputed;
         lease.status = LeaseStatus::Disputed;
+
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Disputed,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
+
         save_lease_instance(&env, lease_id, &lease);
 
         DepositDisputed { lease_id, caller }.publish(&env);
@@ -3066,6 +3139,14 @@ impl LeaseContract {
         if damage_deduction < 0 || damage_deduction > lease.security_deposit {
             return Err(LeaseError::InvalidDeduction);
         }
+
+        let old_status = lease.status.clone();
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
 
         let refund_amount = lease.security_deposit - damage_deduction;
 
@@ -3130,6 +3211,14 @@ impl LeaseContract {
         if return_amount < 0 || slash_amount < 0 {
             return Err(LeaseError::InvalidReleaseMath);
         }
+
+        let old_status = lease.status.clone();
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
 
         let tenant_refund = return_amount;
         let landlord_payout = slash_amount;
@@ -3236,8 +3325,16 @@ impl LeaseContract {
             return Err(LeaseError::InvalidReleaseMath);
         }
 
+        let old_status = lease.status.clone();
         lease.deposit_status = DepositStatus::Disputed;
         lease.status = LeaseStatus::Disputed;
+
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Disputed,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
 
         save_lease_instance(&env, lease_id, &lease);
 
@@ -3310,12 +3407,23 @@ impl LeaseContract {
         let eviction_threshold = lease.rent_amount.saturating_mul(2);
 
         if total_debt >= eviction_threshold {
+            if lease.status != LeaseStatus::Defaulted {
+                let old_status = lease.status.clone();
+                lease.status = LeaseStatus::Defaulted;
+                
+                LeaseStateTransition {
+                    lease_id,
+                    old_status,
+                    new_status: LeaseStatus::Defaulted,
+                    timestamp: current_time,
+                }.publish(&env);
+            }
+
             EvictionEligible {
                 lease_id,
                 tenant: lease.tenant.clone(),
                 debt: total_debt,
-            }
-            .publish(&env);
+            }.publish(&env);
         }
 
         save_lease_instance(&env, lease_id, &lease);
@@ -3926,12 +4034,21 @@ impl LeaseContract {
     fn trigger_dao_arbitration(
         env: &Env,
         lease_id: u64,
-        reason: String
+        reason: String,
     ) -> Result<(), LeaseError> {
         let mut lease = load_lease_instance_by_id(env, lease_id)
             .ok_or(LeaseError::LeaseNotFound)?;
-        
+
+        let old_status = lease.status.clone();
         lease.status = LeaseStatus::DaoArbitration;
+
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::DaoArbitration,
+            timestamp: env.ledger().timestamp(),
+        }.publish(env);
+
         save_lease_instance(env, lease_id, &lease);
         
         DaoArbitrationTriggered {
@@ -3999,13 +4116,20 @@ impl LeaseContract {
     }
 
     fn calculate_yield_distribution(total_yield: i128) -> (i128, i128, i128) {
+        let mut safe_math = SafeMath128::new();
+        
+        // Use optimized safe math for yield distribution
         const LESSEE_BPS: u32 = 5000;
         const LESSOR_BPS: u32 = 3000;
         const DAO_BPS: u32 = 2000;
 
-        let lessee_share = total_yield.saturating_mul(LESSEE_BPS as i128) / 10_000;
-        let lessor_share = total_yield.saturating_mul(LESSOR_BPS as i128) / 10_000;
-        let dao_share = total_yield.saturating_mul(DAO_BPS as i128) / 10_000;
+        // Use ceiling division for protocol safety
+        let lessee_share = safe_math.safe_bps_division_ceiling(total_yield, LESSEE_BPS)
+            .unwrap_or(0);
+        let lessor_share = safe_math.safe_bps_division_ceiling(total_yield, LESSOR_BPS)
+            .unwrap_or(0);
+        let dao_share = safe_math.safe_bps_division_ceiling(total_yield, DAO_BPS)
+            .unwrap_or(0);
 
         (lessee_share, lessor_share, dao_share)
     }
@@ -4297,7 +4421,17 @@ impl LeaseContract {
         }
 
         lease.deposit_status = DepositStatus::Settled;
+        let old_status = lease.status.clone();
         lease.flags &= !lease_flags::ACTIVE;
+        lease.status = LeaseStatus::Terminated;
+
+        LeaseStateTransition {
+            lease_id: payload.lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: current_time,
+        }.publish(env);
+
         save_lease_instance(&env, payload.lease_id, &lease);
 
         // Record deposit slash for velocity tracking
@@ -4484,9 +4618,14 @@ impl LeaseContract {
         let yield_client = yield_protocol::YieldClient::new(&env, &yield_protocol);
         let lp_tokens = yield_client.deposit(&env.current_contract_address(), &deploy_amount);
 
-        if lp_tokens
-            < deploy_amount.saturating_mul(10_000i128 - max_slippage_bps as i128) / 10_000i128
-        {
+        // Use optimized safe math for slippage calculation
+        let mut safe_math = SafeMath128::new();
+        let min_expected = safe_math.safe_bps_division_floor(
+            deploy_amount, 
+            10_000 - max_slippage_bps
+        ).map_err(|_| LeaseError::SlippageExceeded)?;
+        
+        if lp_tokens < min_expected {
             return Err(LeaseError::SlippageExceeded);
         }
 
@@ -4537,42 +4676,50 @@ impl LeaseContract {
             return Err(LeaseError::YieldUnderflow);
         }
 
-        let (lessee_share, lessor_share, dao_share) =
-            Self::calculate_yield_distribution(total_yield);
+        // Use enhanced yield generation with optimized math
+        let mut yield_generator = EnhancedYieldGenerator::new();
+        let distribution = yield_generator.calculate_enhanced_distribution(total_yield, None)
+            .map_err(|_| LeaseError::InvalidDeduction)?;
 
         let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
 
-        if lessee_share > 0 {
+        if distribution.lessee_share > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
                 &lease.tenant,
-                &lessee_share,
+                &distribution.lessee_share,
             );
         }
 
-        if lessor_share > 0 {
+        if distribution.lessor_share > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
                 &lease.landlord,
-                &lessor_share,
+                &distribution.lessor_share,
             );
         }
 
-        if dao_share > 0 {
+        if distribution.dao_share > 0 {
             if let Some(dao_address) = env.storage().instance().get(&DataKey::PlatformFeeRecipient)
             {
-                token_client.transfer(&env.current_contract_address(), &dao_address, &dao_share);
+                token_client.transfer(&env.current_contract_address(), &dao_address, &distribution.dao_share);
             }
         }
 
+        // Use safe math for yield accumulation
+        let mut safe_math = SafeMath128::new();
         let accumulated_yield: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::YieldAccumulated(lease_id))
             .unwrap_or(0);
+        
+        let new_accumulated = safe_math.safe_add_yield(accumulated_yield, total_yield)
+            .map_err(|_| LeaseError::InvalidDeduction)?;
+
         env.storage().persistent().set(
             &DataKey::YieldAccumulated(lease_id),
-            &(accumulated_yield + total_yield),
+            &new_accumulated,
         );
         env.storage().persistent().extend_ttl(
             &DataKey::YieldAccumulated(lease_id),
@@ -4580,12 +4727,19 @@ impl LeaseContract {
             YEAR_IN_LEDGERS,
         );
 
+        // Store precision metrics for monitoring
+        let precision_report = yield_generator.get_performance_report().precision_report;
+        env.storage().temporary().set(
+            &DataKey::YieldAccumulated(lease_id), // Reuse as temp key for metrics
+            &precision_report.cumulative_precision_loss,
+        );
+
         EscrowYieldHarvested {
             lease_id,
             total_yield,
-            lessee_share,
-            lessor_share,
-            dao_share,
+            lessee_share: distribution.lessee_share,
+            lessor_share: distribution.lessor_share,
+            dao_share: distribution.dao_share,
             yield_protocol: deployment.yield_protocol.clone(),
             harvest_timestamp: env.ledger().timestamp(),
         }
@@ -4617,10 +4771,13 @@ impl LeaseContract {
             return Err(LeaseError::YieldUnderflow);
         }
 
-        let min_expected = deployment
-            .principal_amount
-            .saturating_mul(10_000i128 - max_slippage_bps as i128)
-            / 10_000i128;
+        // Use optimized safe math for slippage calculation
+        let mut safe_math = SafeMath128::new();
+        let min_expected = safe_math.safe_bps_division_floor(
+            deployment.principal_amount,
+            10_000 - max_slippage_bps
+        ).map_err(|_| LeaseError::SlippageExceeded)?;
+        
         if withdrawn_amount < min_expected {
             return Err(LeaseError::SlippageExceeded);
         }

@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test {
-    use soroban_sdk::{Address, Bytes, Env};
-    use crate::{LeaseFlowContract, LeaseState, Error, Lease, EscrowVault, ProtocolCreditRecord};
+    use soroban_sdk::{Address, Bytes, Env, Vec};
+    use crate::{LeaseFlowContract, LeaseState, Error, Lease, EscrowVault, ProtocolCreditRecord, MultiSigConfig, ProtocolFeeConfig, FeeUpdateProposal};
 
     #[test]
     fn test_lease_creation_and_states() {
@@ -1158,4 +1158,1000 @@ mod test {
             result.try_into()
         }
     }
+
+    // Multi-signature fee validation tests
+    #[test]
+    fn test_initialize_multisig() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        client.initialize();
+
+        // Create signatories
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        let signatory3 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+        signatories.push_back(signatory3.clone());
+
+        // Initialize multi-sig configuration
+        client.initialize_multisig(
+            &signatories,
+            &2, // threshold of 2 signatures
+            &86400, // 24 hour timelock
+            &3000, // max 30% fee
+            &100, // min 1% fee
+            &500, // max 5% increase per update
+            &200, // initial 2% fee
+        );
+
+        // Verify configuration
+        let config = client.get_multisig_config();
+        assert_eq!(config.threshold, 2);
+        assert_eq!(config.timelock_period, 86400);
+        assert_eq!(config.signatories.len(), 3);
+
+        // Verify protocol fee configuration
+        let fee_config = client.get_protocol_fee_config();
+        assert_eq!(fee_config.protocol_fee_bps, 200);
+        assert_eq!(fee_config.updated_by, signatory1);
+    }
+
+    #[test]
+    fn test_propose_fee_update() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &86400,
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Propose fee update
+        let description = Bytes::from_slice(&env, b"Increase fee to 3%");
+        let proposal_id = client.propose_fee_update(
+            &signatory1,
+            &300, // 3% fee
+            &description,
+        );
+
+        // Verify proposal
+        let proposal = client.get_fee_proposal(&proposal_id);
+        assert_eq!(proposal.proposed_fee_bps, 300);
+        assert_eq!(proposal.proposed_by, signatory1);
+        assert!(!proposal.executed);
+        assert_eq!(proposal.signatures.len(), 0);
+    }
+
+    #[test]
+    fn test_sign_fee_proposal() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &86400,
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Create and sign proposal
+        let description = Bytes::from_slice(&env, b"Increase fee to 3%");
+        let proposal_id = client.propose_fee_update(&signatory1, &300, &description);
+        
+        // First signature
+        client.sign_fee_proposal(&signatory1, &proposal_id);
+        let proposal = client.get_fee_proposal(&proposal_id);
+        assert_eq!(proposal.signatures.len(), 1);
+        assert!(proposal.signatures.contains(&signatory1));
+
+        // Second signature
+        client.sign_fee_proposal(&signatory2, &proposal_id);
+        let proposal = client.get_fee_proposal(&proposal_id);
+        assert_eq!(proposal.signatures.len(), 2);
+        assert!(proposal.signatures.contains(&signatory2));
+
+        // Test double-signing prevention
+        let result = client.try_sign_fee_proposal(&signatory1, &proposal_id);
+        assert_eq!(result, Err(Error::AlreadySigned));
+    }
+
+    #[test]
+    fn test_execute_fee_update() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &1, // 1 second timelock for testing
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Create, sign, and execute proposal
+        let description = Bytes::from_slice(&env, b"Increase fee to 3%");
+        let proposal_id = client.propose_fee_update(&signatory1, &300, &description);
+        
+        client.sign_fee_proposal(&signatory1, &proposal_id);
+        client.sign_fee_proposal(&signatory2, &proposal_id);
+
+        // Wait for timelock
+        env.ledger().set_timestamp(env.ledger().timestamp() + 2);
+
+        // Execute proposal
+        client.execute_fee_update(&signatory1, &proposal_id);
+
+        // Verify fee was updated
+        let fee_config = client.get_protocol_fee_config();
+        assert_eq!(fee_config.protocol_fee_bps, 300);
+        assert_eq!(fee_config.updated_by, signatory1);
+
+        // Verify proposal is marked as executed
+        let proposal = client.get_fee_proposal(&proposal_id);
+        assert!(proposal.executed);
+    }
+
+    #[test]
+    fn test_fee_validation_limits() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &1,
+            &86400,
+            &3000, // max 30%
+            &100,  // min 1%
+            &500,  // max 5% increase
+            &200,  // initial 2%
+        );
+
+        // Test exceeding max fee
+        let description = Bytes::from_slice(&env, b"Excessive fee");
+        let result = client.try_propose_fee_update(&signatory1, &4000, &description);
+        assert_eq!(result, Err(Error::ExceedsMaxFee));
+
+        // Test below min fee
+        let result = client.try_propose_fee_update(&signatory1, &50, &description);
+        assert_eq!(result, Err(Error::BelowMinFee));
+
+        // Test exceeding increase limit
+        let result = client.try_propose_fee_update(&signatory1, &800, &description); // 6% increase
+        assert_eq!(result, Err(Error::InvalidFeeChange));
+    }
+
+    #[test]
+    fn test_multisig_authorization() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &86400,
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Test unauthorized proposal
+        let unauthorized = Address::generate(&env);
+        let description = Bytes::from_slice(&env, b"Unauthorized proposal");
+        let result = client.try_propose_fee_update(&unauthorized, &300, &description);
+        assert_eq!(result, Err(Error::InvalidSignatory));
+
+        // Test unauthorized signing
+        let proposal_id = client.propose_fee_update(&signatory1, &300, &description);
+        let result = client.try_sign_fee_proposal(&unauthorized, &proposal_id);
+        assert_eq!(result, Err(Error::InvalidSignatory));
+    }
+
+    #[test]
+    fn test_protocol_fee_integration() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &1,
+            &1,
+            &3000,
+            &100,
+            &500,
+            &500, // 5% protocol fee
+        );
+
+        // Create lease
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let property_uri = Bytes::from_slice(&env, b"property_uri");
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &1000, // rent amount
+            &2000, // deposit
+            &1000, // start date
+            &5000, // end date
+            &432000, // grace period
+            &300, // late fee (within protocol limits)
+            &property_uri,
+        );
+
+        // Activate lease
+        client.activate_lease(&lease_id, &lessee);
+
+        // Process rent payment (protocol fee should be deducted)
+        client.process_rent_payment(&lease_id, &1000);
+
+        // Check escrow vault for protocol fee collection
+        let vault = client.get_escrow_vault();
+        let expected_protocol_fee = 1000 * 500 / 10000; // 5% of 1000 = 50
+        assert_eq!(vault.lessor_treasury, expected_protocol_fee);
+    }
+
+    #[test]
+    fn test_emergency_fee_update() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &86400,
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Test emergency update by first signatory
+        let reason = Bytes::from_slice(&env, b"Emergency update");
+        client.emergency_fee_update(&signatory1, &400, &reason);
+
+        // Verify fee was updated
+        let fee_config = client.get_protocol_fee_config();
+        assert_eq!(fee_config.protocol_fee_bps, 400);
+
+        // Test unauthorized emergency update
+        let result = client.try_emergency_fee_update(&signatory2, &500, &reason);
+        assert_eq!(result, Err(Error::Unauthorized));
+    }
+
+    #[test]
+    fn test_update_signatory() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &86400,
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Update signatory
+        let new_signatory = Address::generate(&env);
+        client.update_signatory(&signatory1, &signatory2.clone(), &new_signatory.clone());
+
+        // Verify signatory was updated
+        let config = client.get_multisig_config();
+        assert!(config.signatories.contains(&signatory1));
+        assert!(config.signatories.contains(&new_signatory));
+        assert!(!config.signatories.contains(&signatory2));
+    }
+}
+
+//! LeaseFlow – Test Suite
+//!
+//! Tests are organised by state transition.  Every test verifies three things:
+//!   1. The on-chain `Lease.status` changed to the expected state.
+//!   2. The correct contract **event** was emitted (topics + payload).
+//!   3. The aggregate **metrics** counter was incremented.
+//!
+//! Run with:
+//!   ```
+//!   cargo test --package lease-flow -- --nocapture
+//!   ```
+
+#![cfg(test)]
+
+extern crate std;
+use std::println;
+
+use soroban_sdk::{
+    testutils::{Events, Ledger, LedgerInfo},
+    vec, Address, Env, IntoVal, Symbol,
+};
+
+use crate::{
+    DataKey, LeaseFlowContract, LeaseFlowContractClient,
+    LeaseState, StateTransitionEvent, TransitionMetrics,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Test Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a fresh test environment with a deterministic ledger sequence.
+fn setup_env() -> Env {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set(LedgerInfo {
+        timestamp:          1_700_000_000,
+        protocol_version:   22,
+        sequence_number:    100,
+        network_id:         Default::default(),
+        base_reserve:       10,
+        min_temp_entry_ttl: 16,
+        min_persistent_entry_ttl: 4096,
+        max_entry_ttl:      6_312_000,
+    });
+    env
+}
+
+/// Register the contract and return a typed client.
+fn deploy(env: &Env) -> LeaseFlowContractClient {
+    let contract_id = env.register(LeaseFlowContract, ());
+    LeaseFlowContractClient::new(env, &contract_id)
+}
+
+/// Deterministic addresses for actors.
+fn landlord(env: &Env) -> Address { Address::generate(env) }
+fn tenant(env: &Env)   -> Address { Address::generate(env) }
+
+/// Create a standard lease; returns (lease_id, landlord, tenant).
+fn make_lease(
+    client:   &LeaseFlowContractClient,
+    env:      &Env,
+) -> (u64, Address, Address) {
+    let ll = landlord(env);
+    let tt = tenant(env);
+
+    let id = client.create_lease(
+        &ll,
+        &tt,
+        &1_000_i128,   // rent_amount
+        &5_000_i128,   // deposit_amount
+        &1_700_000_000_u64,
+        &1_702_678_400_u64,
+        &soroban_sdk::String::from_str(env, "ipfs://QmTest"),
+    );
+
+    (id, ll, tt)
+}
+
+/// Pull the last emitted event payload and assert its fields.
+fn last_transition_event(env: &Env) -> StateTransitionEvent {
+    let all_events = env.events().all();
+    // The last event in the list is the most recent.
+    let (_cid, _topics, data) = all_events.last().unwrap();
+    data.into_val(env)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 1. CREATE LEASE → Pending
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_create_lease_emits_created_event() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, _tt) = make_lease(&client, &env);
+
+    println!("[test_create_lease] lease_id={id}");
+
+    // 1a. Lease stored as Pending
+    let lease = client.get_lease(&id);
+    assert_eq!(lease.status, LeaseState::Pending, "status should be Pending after creation");
+
+    // 1b. Event payload
+    let evt: StateTransitionEvent = last_transition_event(&env);
+    assert_eq!(evt.lease_id,   id);
+    assert_eq!(evt.to_state,   LeaseState::Pending);
+    assert_eq!(evt.actor,      ll);
+    assert_eq!(evt.reason,     Symbol::new(&env, "created"));
+
+    println!("[test_create_lease] ✓ event emitted: reason={:?}", evt.reason);
+
+    // 1c. No metric counter for creation (by design – creation is not a transition)
+    let m = client.get_metrics();
+    assert_eq!(m.total_transitions, 0, "no metric counter on creation");
+}
+
+#[test]
+fn test_lease_counter_increments() {
+    let env    = setup_env();
+    let client = deploy(&env);
+
+    assert_eq!(client.get_lease_count(), 0);
+    make_lease(&client, &env);
+    assert_eq!(client.get_lease_count(), 1);
+    make_lease(&client, &env);
+    assert_eq!(client.get_lease_count(), 2);
+
+    println!("[test_lease_counter] ✓ counter increments correctly");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. ACTIVATE LEASE  (Pending → Active)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_activate_lease_emits_activated_event_and_increments_metric() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, _ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+
+    println!("[test_activate] lease_id={id}");
+
+    // 2a. Status flipped to Active
+    let lease = client.get_lease(&id);
+    assert_eq!(lease.status, LeaseState::Active);
+    assert_eq!(lease.deposit_paid, 5_000);
+
+    // 2b. Event
+    let evt: StateTransitionEvent = last_transition_event(&env);
+    assert_eq!(evt.from_state, LeaseState::Pending);
+    assert_eq!(evt.to_state,   LeaseState::Active);
+    assert_eq!(evt.actor,      tt);
+    assert_eq!(evt.reason,     Symbol::new(&env, "activated"));
+
+    // 2c. Metric
+    let m = client.get_metrics();
+    assert_eq!(m.pending_to_active,  1);
+    assert_eq!(m.total_transitions,  1);
+
+    println!("[test_activate] ✓ metric pending_to_active={}", m.pending_to_active);
+}
+
+#[test]
+#[should_panic(expected = "lease must be Pending to activate")]
+fn test_activate_already_active_lease_panics() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, _ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    // Second activation must fail
+    client.activate_lease(&id, &tt, &5_000_i128);
+}
+
+#[test]
+#[should_panic(expected = "deposit too low")]
+fn test_activate_with_insufficient_deposit_panics() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, _ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &100_i128); // deposit_amount is 5_000
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 3. TRIGGER EVICTION  (Active → Eviction)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_trigger_eviction_emits_eviction_event_and_increments_metric() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.trigger_eviction(&id, &ll);
+
+    println!("[test_eviction] lease_id={id}");
+
+    // 3a. Status
+    assert_eq!(client.get_lease(&id).status, LeaseState::Eviction);
+
+    // 3b. Event
+    let evt: StateTransitionEvent = last_transition_event(&env);
+    assert_eq!(evt.from_state, LeaseState::Active);
+    assert_eq!(evt.to_state,   LeaseState::Eviction);
+    assert_eq!(evt.reason,     Symbol::new(&env, "eviction"));
+
+    // 3c. Metric
+    let m = client.get_metrics();
+    assert_eq!(m.active_to_eviction, 1);
+    assert_eq!(m.total_transitions,  2); // activate + eviction
+
+    println!("[test_eviction] ✓ metric active_to_eviction={}", m.active_to_eviction);
+}
+
+#[test]
+#[should_panic(expected = "can only evict an Active lease")]
+fn test_evict_pending_lease_panics() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, _tt) = make_lease(&client, &env);
+
+    client.trigger_eviction(&id, &ll);
+}
+
+#[test]
+#[should_panic(expected = "only the landlord may trigger eviction")]
+fn test_eviction_by_non_landlord_panics() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, _ll, tt) = make_lease(&client, &env);
+    let impostor = Address::generate(&env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.trigger_eviction(&id, &impostor);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. MARK DEFAULTED  (Active → Defaulted)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_mark_defaulted_emits_defaulted_event_and_increments_metric() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.mark_defaulted(&id, &ll);
+
+    println!("[test_defaulted] lease_id={id}");
+
+    assert_eq!(client.get_lease(&id).status, LeaseState::Defaulted);
+
+    let evt: StateTransitionEvent = last_transition_event(&env);
+    assert_eq!(evt.from_state, LeaseState::Active);
+    assert_eq!(evt.to_state,   LeaseState::Defaulted);
+    assert_eq!(evt.reason,     Symbol::new(&env, "defaulted"));
+
+    let m = client.get_metrics();
+    assert_eq!(m.active_to_defaulted, 1);
+    assert_eq!(m.total_transitions,   2);
+
+    println!("[test_defaulted] ✓ metric active_to_defaulted={}", m.active_to_defaulted);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. RAISE DISPUTE  (Active → Disputed)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_raise_dispute_emits_disputed_event_and_increments_metric() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.raise_dispute(&id, &ll);
+
+    println!("[test_disputed] lease_id={id}");
+
+    assert_eq!(client.get_lease(&id).status, LeaseState::Disputed);
+
+    let evt: StateTransitionEvent = last_transition_event(&env);
+    assert_eq!(evt.from_state, LeaseState::Active);
+    assert_eq!(evt.to_state,   LeaseState::Disputed);
+    assert_eq!(evt.reason,     Symbol::new(&env, "disputed"));
+
+    let m = client.get_metrics();
+    assert_eq!(m.active_to_disputed, 1);
+    assert_eq!(m.total_transitions,  2);
+
+    println!("[test_disputed] ✓ metric active_to_disputed={}", m.active_to_disputed);
+}
+
+#[test]
+#[should_panic(expected = "only the landlord may raise a dispute")]
+fn test_raise_dispute_by_tenant_panics() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, _ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.raise_dispute(&id, &tt);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. CLOSE LEASE – from every valid source state
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_close_from_active_increments_active_to_closed() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.close_lease(&id, &ll);
+
+    println!("[test_close_active] lease_id={id}");
+
+    assert_eq!(client.get_lease(&id).status, LeaseState::Closed);
+
+    let evt: StateTransitionEvent = last_transition_event(&env);
+    assert_eq!(evt.from_state, LeaseState::Active);
+    assert_eq!(evt.to_state,   LeaseState::Closed);
+    assert_eq!(evt.reason,     Symbol::new(&env, "closed"));
+
+    let m = client.get_metrics();
+    assert_eq!(m.active_to_closed,  1);
+    assert_eq!(m.total_transitions, 2);
+
+    println!("[test_close_active] ✓ metric active_to_closed={}", m.active_to_closed);
+}
+
+#[test]
+fn test_close_from_eviction_increments_eviction_to_closed() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.trigger_eviction(&id, &ll);
+    client.close_lease(&id, &ll);
+
+    let m = client.get_metrics();
+    assert_eq!(m.eviction_to_closed, 1, "eviction_to_closed should be 1");
+
+    println!("[test_close_eviction] ✓ metric eviction_to_closed={}", m.eviction_to_closed);
+}
+
+#[test]
+fn test_close_from_disputed_increments_disputed_to_closed() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.raise_dispute(&id, &ll);
+    client.close_lease(&id, &ll);
+
+    let m = client.get_metrics();
+    assert_eq!(m.disputed_to_closed, 1);
+
+    println!("[test_close_disputed] ✓ metric disputed_to_closed={}", m.disputed_to_closed);
+}
+
+#[test]
+fn test_close_from_defaulted_increments_defaulted_to_closed() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.mark_defaulted(&id, &ll);
+    client.close_lease(&id, &ll);
+
+    let m = client.get_metrics();
+    assert_eq!(m.defaulted_to_closed, 1);
+
+    println!("[test_close_defaulted] ✓ metric defaulted_to_closed={}", m.defaulted_to_closed);
+}
+
+#[test]
+#[should_panic(expected = "lease cannot be closed from current state")]
+fn test_close_already_closed_lease_panics() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.close_lease(&id, &ll);
+    client.close_lease(&id, &ll); // double-close must fail
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. STREAM RENT – auto-eviction when funds exhausted
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_stream_rent_auto_triggers_eviction_when_deposit_exhausted() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    // deposit_amount = 5_000; stream 5_000 in one call → auto-eviction
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.stream_rent(&id, &ll, &5_000_i128);
+
+    println!("[test_stream_auto_evict] lease_id={id}");
+
+    assert_eq!(client.get_lease(&id).status, LeaseState::Eviction);
+
+    let evt: StateTransitionEvent = last_transition_event(&env);
+    assert_eq!(evt.from_state, LeaseState::Active);
+    assert_eq!(evt.to_state,   LeaseState::Eviction);
+    assert_eq!(evt.reason,     Symbol::new(&env, "eviction"));
+
+    let m = client.get_metrics();
+    assert_eq!(m.active_to_eviction, 1);
+
+    println!("[test_stream_auto_evict] ✓ auto-eviction triggered, metric active_to_eviction={}", m.active_to_eviction);
+}
+
+#[test]
+fn test_stream_rent_partial_does_not_trigger_eviction() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.stream_rent(&id, &ll, &1_000_i128);
+
+    let lease = client.get_lease(&id);
+    assert_eq!(lease.status,          LeaseState::Active);
+    assert_eq!(lease.streamed_amount,  1_000);
+
+    let m = client.get_metrics();
+    assert_eq!(m.active_to_eviction, 0, "no eviction on partial stream");
+
+    println!("[test_stream_partial] ✓ partial stream, lease still Active");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. FULL HAPPY PATH  (Pending → Active → Closed)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_full_happy_path_metrics_accumulate_correctly() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    // Step 1: activate
+    client.activate_lease(&id, &tt, &5_000_i128);
+    // Step 2: stream some rent
+    client.stream_rent(&id, &ll, &2_000_i128);
+    // Step 3: close
+    client.close_lease(&id, &ll);
+
+    println!("[test_happy_path] lease_id={id}");
+
+    let lease = client.get_lease(&id);
+    assert_eq!(lease.status,          LeaseState::Closed);
+    assert_eq!(lease.streamed_amount,  2_000);
+
+    let m = client.get_metrics();
+    // activate + close = 2 total
+    assert_eq!(m.total_transitions,  2);
+    assert_eq!(m.pending_to_active,  1);
+    assert_eq!(m.active_to_closed,   1);
+    assert_eq!(m.active_to_eviction, 0);
+
+    println!(
+        "[test_happy_path] ✓ totals: transitions={}, pending_to_active={}, active_to_closed={}",
+        m.total_transitions, m.pending_to_active, m.active_to_closed
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. FULL DISPUTED PATH  (Pending → Active → Disputed → Closed)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_disputed_path_metrics() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.raise_dispute(&id, &ll);
+    client.close_lease(&id, &ll);
+
+    let m = client.get_metrics();
+    assert_eq!(m.total_transitions,  3);
+    assert_eq!(m.pending_to_active,  1);
+    assert_eq!(m.active_to_disputed, 1);
+    assert_eq!(m.disputed_to_closed, 1);
+
+    println!(
+        "[test_disputed_path] ✓ transitions={} (activate + dispute + close)",
+        m.total_transitions
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 10. FULL EVICTION PATH  (Pending → Active → Eviction → Defaulted → Closed)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_eviction_then_default_path_metrics() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, ll, tt) = make_lease(&client, &env);
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+    client.trigger_eviction(&id, &ll);
+    client.mark_defaulted(&id, &ll);
+    client.close_lease(&id, &ll);
+
+    let m = client.get_metrics();
+    assert_eq!(m.total_transitions,   4);
+    assert_eq!(m.pending_to_active,   1);
+    assert_eq!(m.active_to_eviction,  1);
+    assert_eq!(m.active_to_defaulted, 1); // from Eviction state
+    assert_eq!(m.defaulted_to_closed, 1);
+
+    println!(
+        "[test_eviction_default_path] ✓ full eviction path, transitions={}",
+        m.total_transitions
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 11. MULTI-LEASE ISOLATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_multiple_leases_share_global_metrics() {
+    let env    = setup_env();
+    let client = deploy(&env);
+
+    // Lease A: happy path
+    let (id_a, ll_a, tt_a) = make_lease(&client, &env);
+    client.activate_lease(&id_a, &tt_a, &5_000_i128);
+    client.close_lease(&id_a, &ll_a);
+
+    // Lease B: disputed path
+    let (id_b, ll_b, tt_b) = make_lease(&client, &env);
+    client.activate_lease(&id_b, &tt_b, &5_000_i128);
+    client.raise_dispute(&id_b, &ll_b);
+    client.close_lease(&id_b, &ll_b);
+
+    // Lease C: eviction path
+    let (id_c, ll_c, tt_c) = make_lease(&client, &env);
+    client.activate_lease(&id_c, &tt_c, &5_000_i128);
+    client.trigger_eviction(&id_c, &ll_c);
+    client.close_lease(&id_c, &ll_c);
+
+    println!("[test_multi_lease] lease_ids: {id_a}, {id_b}, {id_c}");
+
+    let m = client.get_metrics();
+    // 3 activations + 3 closes + 1 dispute + 1 eviction = 8
+    assert_eq!(m.total_transitions,  8);
+    assert_eq!(m.pending_to_active,  3);
+    assert_eq!(m.active_to_closed,   1);
+    assert_eq!(m.active_to_disputed, 1);
+    assert_eq!(m.active_to_eviction, 1);
+    assert_eq!(m.disputed_to_closed, 1);
+    assert_eq!(m.eviction_to_closed, 1);
+
+    // Leases are independent
+    assert_eq!(client.get_lease(&id_a).status, LeaseState::Closed);
+    assert_eq!(client.get_lease(&id_b).status, LeaseState::Closed);
+    assert_eq!(client.get_lease(&id_c).status, LeaseState::Closed);
+
+    println!(
+        "[test_multi_lease] ✓ global totals: transitions={}, pending_to_active={}, \
+         active_to_eviction={}, active_to_disputed={}, eviction_to_closed={}, \
+         disputed_to_closed={}",
+        m.total_transitions, m.pending_to_active, m.active_to_eviction,
+        m.active_to_disputed, m.eviction_to_closed, m.disputed_to_closed,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 12. EVENT PAYLOAD TIMESTAMP MATCHES LEDGER
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_event_timestamp_matches_ledger_sequence() {
+    let env    = setup_env();
+    let client = deploy(&env);
+    let (id, _ll, tt) = make_lease(&client, &env);
+
+    // Advance the ledger
+    env.ledger().set(LedgerInfo {
+        timestamp:          1_700_000_500,
+        protocol_version:   22,
+        sequence_number:    250,
+        network_id:         Default::default(),
+        base_reserve:       10,
+        min_temp_entry_ttl: 16,
+        min_persistent_entry_ttl: 4096,
+        max_entry_ttl:      6_312_000,
+    });
+
+    client.activate_lease(&id, &tt, &5_000_i128);
+
+    let evt: StateTransitionEvent = last_transition_event(&env);
+    assert_eq!(evt.timestamp, 250, "timestamp should match ledger sequence_number=250");
+
+    println!("[test_timestamp] ✓ event.timestamp={} matches ledger.sequence=250", evt.timestamp);
 }
