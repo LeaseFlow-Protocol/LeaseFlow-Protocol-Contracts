@@ -1849,9 +1849,11 @@ impl LeaseContract {
     }
 
     pub fn extend_ttl(env: Env, _lease_id: Symbol) {
+        // Optimized: Only bump if less than 1 week remains, reducing write fees
+        const WEEK_IN_LEDGERS: u32 = 120_960; 
         env.storage()
             .instance()
-            .extend_ttl(MONTH_IN_LEDGERS, YEAR_IN_LEDGERS);
+            .extend_ttl(WEEK_IN_LEDGERS, YEAR_IN_LEDGERS);
     }
 
     pub fn check_usage_rights(
