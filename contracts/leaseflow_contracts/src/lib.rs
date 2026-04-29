@@ -77,6 +77,7 @@ pub enum LeaseStatus {
     Disputed,
     Terminated,
     DaoArbitration,
+    Defaulted,
 }
 
 #[contracttype]
@@ -602,6 +603,14 @@ pub struct ActiveLeaseSummary {
     pub active: bool,
     pub yield_delegation_enabled: bool,
     pub equity_percentage_bps: u32,
+}
+
+#[contractevent]
+pub struct LeaseStateTransition {
+    pub lease_id: u64,
+    pub old_status: LeaseStatus,
+    pub new_status: LeaseStatus,
+    pub timestamp: u64,
 }
 
 // Issue #126: Read-only termination simulation result
@@ -2163,6 +2172,13 @@ impl LeaseContract {
         };
         save_lease_instance(&env, lease_id, &lease);
 
+        LeaseStateTransition {
+            lease_id,
+            old_status: LeaseStatus::Pending,
+            new_status: LeaseStatus::Pending,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
+
         // Add to active leases index for optimized querying (Issue #124)
         let idx_result = Self::add_to_active_leases_index(&env, lease_id);
         // Initialize velocity tracker for landlord and update portfolio size
@@ -2285,6 +2301,14 @@ impl LeaseContract {
 
         if let Some(buyout_price) = lease.buyout_price {
             if lease.cumulative_payments >= buyout_price {
+                let old_status = lease.status.clone();
+                LeaseStateTransition {
+                    lease_id,
+                    old_status,
+                    new_status: LeaseStatus::Terminated,
+                    timestamp: env.ledger().timestamp(),
+                }.publish(&env);
+
                 lease.flags &= !lease_flags::ACTIVE;
                 lease.status = LeaseStatus::Terminated;
                 if let (Some(nft), Some(id)) = (&lease.nft_contract, &lease.token_id) {
@@ -2416,6 +2440,14 @@ impl LeaseContract {
         {
             return Err(LeaseError::DepositNotSettled);
         }
+
+        let old_status = lease.status.clone();
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
 
         const BOUNTY_BPS: i128 = 1_000;
         if let (Some(fee_amount), Some(fee_token), Some(fee_recipient)) = (
@@ -2562,9 +2594,17 @@ impl LeaseContract {
         }
 
         // Update lease status
+        let old_status = lease.status.clone();
         lease.status = LeaseStatus::Terminated;
         lease.deposit_status = DepositStatus::Settled;
         lease.flags &= !lease_flags::ACTIVE;
+
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: current_time,
+        }.publish(&env);
 
         // Handle NFT if present
         if let (Some(nft_contract), Some(token_id)) = 
@@ -2682,6 +2722,14 @@ impl LeaseContract {
         if damage_deduction > 0 {
             validate_partial_deduction(&env, lease_id, damage_deduction, landlord)?;
         }
+
+        let old_status = lease.status.clone();
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
 
         if damage_deduction < 0 || damage_deduction > lease.deposit_amount {
             return Err(LeaseError::InvalidDeduction);
@@ -2859,6 +2907,14 @@ impl LeaseContract {
             );
         }
 
+        let old_status = lease.status.clone();
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
+
         lease.status = LeaseStatus::Terminated;
         lease.flags &= !lease_flags::ACTIVE;
 
@@ -3008,8 +3064,17 @@ impl LeaseContract {
         }
         caller.require_auth();
 
+        let old_status = lease.status.clone();
         lease.deposit_status = DepositStatus::Disputed;
         lease.status = LeaseStatus::Disputed;
+
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Disputed,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
+
         save_lease_instance(&env, lease_id, &lease);
 
         DepositDisputed { lease_id, caller }.publish(&env);
@@ -3064,6 +3129,14 @@ impl LeaseContract {
         if damage_deduction < 0 || damage_deduction > lease.security_deposit {
             return Err(LeaseError::InvalidDeduction);
         }
+
+        let old_status = lease.status.clone();
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
 
         let refund_amount = lease.security_deposit - damage_deduction;
 
@@ -3128,6 +3201,14 @@ impl LeaseContract {
         if return_amount < 0 || slash_amount < 0 {
             return Err(LeaseError::InvalidReleaseMath);
         }
+
+        let old_status = lease.status.clone();
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
 
         let tenant_refund = return_amount;
         let landlord_payout = slash_amount;
@@ -3234,8 +3315,16 @@ impl LeaseContract {
             return Err(LeaseError::InvalidReleaseMath);
         }
 
+        let old_status = lease.status.clone();
         lease.deposit_status = DepositStatus::Disputed;
         lease.status = LeaseStatus::Disputed;
+
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::Disputed,
+            timestamp: env.ledger().timestamp(),
+        }.publish(&env);
 
         save_lease_instance(&env, lease_id, &lease);
 
@@ -3308,12 +3397,23 @@ impl LeaseContract {
         let eviction_threshold = lease.rent_amount.saturating_mul(2);
 
         if total_debt >= eviction_threshold {
+            if lease.status != LeaseStatus::Defaulted {
+                let old_status = lease.status.clone();
+                lease.status = LeaseStatus::Defaulted;
+                
+                LeaseStateTransition {
+                    lease_id,
+                    old_status,
+                    new_status: LeaseStatus::Defaulted,
+                    timestamp: current_time,
+                }.publish(&env);
+            }
+
             EvictionEligible {
                 lease_id,
                 tenant: lease.tenant.clone(),
                 debt: total_debt,
-            }
-            .publish(&env);
+            }.publish(&env);
         }
 
         save_lease_instance(&env, lease_id, &lease);
@@ -3924,12 +4024,21 @@ impl LeaseContract {
     fn trigger_dao_arbitration(
         env: &Env,
         lease_id: u64,
-        reason: String
+        reason: String,
     ) -> Result<(), LeaseError> {
         let mut lease = load_lease_instance_by_id(env, lease_id)
             .ok_or(LeaseError::LeaseNotFound)?;
-        
+
+        let old_status = lease.status.clone();
         lease.status = LeaseStatus::DaoArbitration;
+
+        LeaseStateTransition {
+            lease_id,
+            old_status,
+            new_status: LeaseStatus::DaoArbitration,
+            timestamp: env.ledger().timestamp(),
+        }.publish(env);
+
         save_lease_instance(env, lease_id, &lease);
         
         DaoArbitrationTriggered {
@@ -4295,7 +4404,17 @@ impl LeaseContract {
         }
 
         lease.deposit_status = DepositStatus::Settled;
+        let old_status = lease.status.clone();
         lease.flags &= !lease_flags::ACTIVE;
+        lease.status = LeaseStatus::Terminated;
+
+        LeaseStateTransition {
+            lease_id: payload.lease_id,
+            old_status,
+            new_status: LeaseStatus::Terminated,
+            timestamp: current_time,
+        }.publish(env);
+
         save_lease_instance(&env, payload.lease_id, &lease);
 
         // Record deposit slash for velocity tracking
