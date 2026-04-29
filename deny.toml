@@ -1,0 +1,91 @@
+# Dependency security policy configuration
+# See https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+]
+
+[advisories]
+# Path to the advisory database
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# Alert on security vulnerabilities
+vulnerability = "deny"
+unmaintained = "warn"
+yanked = "warn"
+notice = "warn"
+
+# Ignore specific advisories (add as needed)
+# [[advisories]]
+# id = "RUSTSEC-0000-0000"
+# reason = "Reason for ignoring"
+
+[licenses]
+# List of allowed licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+]
+
+# Deny these licenses
+deny = [
+    "GPL-2.0",
+    "GPL-3.0",
+    "AGPL-1.0",
+    "AGPL-3.0",
+]
+
+# Copyleft licenses to detect
+copyleft = "warn"
+
+[bans]
+# Detect multiple versions of the same crate
+multiple-versions = "deny"
+
+# Wildcard dependencies are not allowed
+wildcards = "deny"
+
+# Specific crates to deny
+# [[bans.deny]]
+# name = "openssl-sys"
+# reason = "Use rustls instead"
+
+# Allow specific multiple versions (temporary)
+[[bans.allow]]
+name = "hashbrown"
+version = ">=0.13.0"
+
+[[bans.allow]]
+name = "rand"
+version = ">=0.8.0"
+
+[[bans.allow]]
+name = "syn"
+version = ">=1.0.0"
+
+[[bans.allow]]
+name = "stellar-strkey"
+version = ">=0.0.13"
+
+[sources]
+# Require dependencies to be from known sources
+unknown-registry = "warn"
+unknown-git = "deny"
+
+# Allow specific git sources
+# [[sources.allow]]
+# git = "https://github.com/example/repo"
+
+[licenses.private]
+# Ignore private crate licenses
+ignore = true
