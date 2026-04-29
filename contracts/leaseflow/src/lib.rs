@@ -30,6 +30,12 @@ pub struct OracleConfig {
 // Contract state key
 const DATA_KEY: Symbol = symbol!("DATA");
 
+// Multi-signature configuration keys
+const MULTISIG_CONFIG_KEY: Symbol = symbol!("MULTISIG_CONFIG");
+const PROTOCOL_FEE_CONFIG_KEY: Symbol = symbol!("PROTOCOL_FEE_CONFIG");
+const FEE_PROPOSAL_KEY: Symbol = symbol!("FEE_PROPOSAL");
+const SIGNATURE_KEY: Symbol = symbol!("SIGNATURE");
+
 // Lease states
 #[derive(Copy, Clone, Debug, Eq, PartialEq, contracttype)]
 pub enum LeaseState {
@@ -66,6 +72,18 @@ pub enum Error {
     RateLimitExceeded = 20,
     UserLeasesLimitExceeded = 21,
     AssociatedLeaseIdsLimitExceeded = 22,
+    // Multi-signature validation errors
+    MultiSigNotInitialized = 21,
+    InvalidSignatory = 22,
+    AlreadySigned = 23,
+    InsufficientSignatures = 24,
+    SignatureExpired = 25,
+    InvalidProposal = 26,
+    ProposalAlreadyExecuted = 27,
+    TimelockNotExpired = 28,
+    ExceedsMaxFee = 29,
+    BelowMinFee = 30,
+    InvalidFeeChange = 31,
 }
 
 // Events
@@ -138,6 +156,71 @@ pub struct FiatPeggedRentBilledEvent {
     pub final_crypto_deduction: i64,
     pub billing_timestamp: u64,
     pub asset_address: Address,
+}
+
+// Multi-signature configuration for protocol fee modifications
+#[derive(Clone, Debug, contracttype)]
+pub struct MultiSigConfig {
+    pub signatories: Vec<Address>,
+    pub threshold: u32, // Minimum signatures required
+    pub timelock_period: u64, // Time delay before execution (seconds)
+    pub max_fee_bps: u32, // Maximum protocol fee in basis points
+    pub min_fee_bps: u32, // Minimum protocol fee in basis points
+    pub max_increase_bps: u32, // Maximum increase per update in basis points
+}
+
+// Protocol-wide fee configuration
+#[derive(Clone, Debug, contracttype)]
+pub struct ProtocolFeeConfig {
+    pub protocol_fee_bps: u32, // Current protocol fee in basis points
+    pub last_updated: u64, // Timestamp of last update
+    pub updated_by: Address, // Who made the last update
+}
+
+// Fee update proposal for multi-signature validation
+#[derive(Clone, Debug, contracttype)]
+pub struct FeeUpdateProposal {
+    pub proposal_id: u64,
+    pub proposed_fee_bps: u32,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub execution_time: u64, // When this can be executed (after timelock)
+    pub description: Bytes, // Description of the change
+    pub executed: bool,
+    pub signatures: Vec<Address>, // Addresses that have signed
+}
+
+// Individual signature record
+#[derive(Clone, Debug, contracttype)]
+pub struct SignatureRecord {
+    pub signer: Address,
+    pub proposal_id: u64,
+    pub signed_at: u64,
+    pub signature_data: Bytes, // Optional signature data for off-chain verification
+}
+
+// Events for multi-signature operations
+#[contracttype]
+pub struct FeeProposalCreatedEvent {
+    pub proposal_id: u64,
+    pub proposed_fee_bps: u32,
+    pub proposed_by: Address,
+    pub execution_time: u64,
+}
+
+#[contracttype]
+pub struct FeeProposalSignedEvent {
+    pub proposal_id: u64,
+    pub signer: Address,
+    pub signatures_count: u32,
+}
+
+#[contracttype]
+pub struct FeeProposalExecutedEvent {
+    pub proposal_id: u64,
+    pub new_fee_bps: u32,
+    pub executed_by: Address,
+    pub executed_at: u64,
 }
 
 // Protocol Credit Record for tracking residual debt
@@ -236,6 +319,382 @@ impl LeaseFlowContract {
         env.storage().instance().set(&DATA_KEY, &data);
     }
 
+    // Initialize multi-signature configuration for protocol fee management
+    pub fn initialize_multisig(
+        env: env::Env,
+        signatories: Vec<Address>,
+        threshold: u32,
+        timelock_period: u64,
+        max_fee_bps: u32,
+        min_fee_bps: u32,
+        max_increase_bps: u32,
+        initial_fee_bps: u32,
+    ) -> Result<(), Error> {
+        // Validate inputs
+        if signatories.is_empty() {
+            return Err(Error::InvalidProposal);
+        }
+        if threshold == 0 || threshold > signatories.len() as u32 {
+            return Err(Error::InvalidProposal);
+        }
+        if max_fee_bps <= min_fee_bps {
+            return Err(Error::InvalidFeeChange);
+        }
+        if initial_fee_bps < min_fee_bps || initial_fee_bps > max_fee_bps {
+            return Err(Error::InvalidFeeChange);
+        }
+
+        // Check if already initialized
+        if env.storage().instance().has(&MULTISIG_CONFIG_KEY) {
+            return Err(Error::MultiSigNotInitialized);
+        }
+
+        // Create multi-signature configuration
+        let multisig_config = MultiSigConfig {
+            signatories: signatories.clone(),
+            threshold,
+            timelock_period,
+            max_fee_bps,
+            min_fee_bps,
+            max_increase_bps,
+        };
+
+        // Create initial protocol fee configuration
+        let protocol_fee_config = ProtocolFeeConfig {
+            protocol_fee_bps: initial_fee_bps,
+            last_updated: env.ledger().timestamp(),
+            updated_by: signatories.get(0).unwrap(), // First signatory as initial updater
+        };
+
+        // Store configurations
+        env.storage().instance().set(&MULTISIG_CONFIG_KEY, &multisig_config);
+        env.storage().instance().set(&PROTOCOL_FEE_CONFIG_KEY, &protocol_fee_config);
+
+        Ok(())
+    }
+
+    // Create a fee update proposal
+    pub fn propose_fee_update(
+        env: env::Env,
+        proposer: Address,
+        new_fee_bps: u32,
+        description: Bytes,
+    ) -> Result<u64, Error> {
+        // Verify multi-sig is initialized
+        let multisig_config: MultiSigConfig = env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        // Verify proposer is a signatory
+        if !multisig_config.signatories.contains(&proposer) {
+            return Err(Error::InvalidSignatory);
+        }
+
+        // Get current fee config
+        let current_config: ProtocolFeeConfig = env.storage().instance()
+            .get(&PROTOCOL_FEE_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        // Validate fee bounds
+        if new_fee_bps < multisig_config.min_fee_bps || new_fee_bps > multisig_config.max_fee_bps {
+            return Err(Error::ExceedsMaxFee);
+        }
+
+        // Validate increase limit
+        if new_fee_bps > current_config.protocol_fee_bps {
+            let increase = new_fee_bps.saturating_sub(current_config.protocol_fee_bps);
+            if increase > multisig_config.max_increase_bps {
+                return Err(Error::InvalidFeeChange);
+            }
+        }
+
+        // Generate proposal ID (simple increment)
+        let proposal_id = env.ledger().sequence(); // Use ledger sequence as unique ID
+
+        // Calculate execution time (after timelock)
+        let execution_time = env.ledger().timestamp() + multisig_config.timelock_period;
+
+        // Create proposal
+        let proposal = FeeUpdateProposal {
+            proposal_id,
+            proposed_fee_bps: new_fee_bps,
+            proposed_by: proposer.clone(),
+            proposed_at: env.ledger().timestamp(),
+            execution_time,
+            description,
+            executed: false,
+            signatures: Vec::new(&env),
+        };
+
+        // Store proposal
+        env.storage().instance().set(&FEE_PROPOSAL_KEY, &proposal_id, &proposal);
+
+        // Emit event
+        env.events().publish(
+            symbol!("FeeProposalCreated"),
+            FeeProposalCreatedEvent {
+                proposal_id,
+                proposed_fee_bps: new_fee_bps,
+                proposed_by: proposer,
+                execution_time,
+            },
+        );
+
+        Ok(proposal_id)
+    }
+
+    // Sign a fee update proposal
+    pub fn sign_fee_proposal(
+        env: env::Env,
+        signer: Address,
+        proposal_id: u64,
+    ) -> Result<(), Error> {
+        // Verify multi-sig is initialized
+        let multisig_config: MultiSigConfig = env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        // Verify signer is a signatory
+        if !multisig_config.signatories.contains(&signer) {
+            return Err(Error::InvalidSignatory);
+        }
+
+        // Get proposal
+        let mut proposal: FeeUpdateProposal = env.storage().instance()
+            .get(&FEE_PROPOSAL_KEY, &proposal_id)
+            .ok_or(Error::InvalidProposal)?;
+
+        // Check if proposal is already executed
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        // Check if already signed
+        if proposal.signatures.contains(&signer) {
+            return Err(Error::AlreadySigned);
+        }
+
+        // Add signature
+        proposal.signatures.push_back(signer.clone());
+
+        // Create signature record
+        let signature_record = SignatureRecord {
+            signer: signer.clone(),
+            proposal_id,
+            signed_at: env.ledger().timestamp(),
+            signature_data: Bytes::new(&env),
+        };
+
+        // Store updated proposal and signature record
+        env.storage().instance().set(&FEE_PROPOSAL_KEY, &proposal_id, &proposal);
+        env.storage().instance().set(&SIGNATURE_KEY, &proposal_id, &signer, &signature_record);
+
+        // Emit event
+        env.events().publish(
+            symbol!("FeeProposalSigned"),
+            FeeProposalSignedEvent {
+                proposal_id,
+                signer,
+                signatures_count: proposal.signatures.len() as u32,
+            },
+        );
+
+        Ok(())
+    }
+
+    // Execute a fee update proposal
+    pub fn execute_fee_update(
+        env: env::Env,
+        executor: Address,
+        proposal_id: u64,
+    ) -> Result<(), Error> {
+        // Verify multi-sig is initialized
+        let multisig_config: MultiSigConfig = env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        // Get proposal
+        let mut proposal: FeeUpdateProposal = env.storage().instance()
+            .get(&FEE_PROPOSAL_KEY, &proposal_id)
+            .ok_or(Error::InvalidProposal)?;
+
+        // Check if already executed
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        // Check timelock
+        let current_time = env.ledger().timestamp();
+        if current_time < proposal.execution_time {
+            return Err(Error::TimelockNotExpired);
+        }
+
+        // Check signature threshold
+        if proposal.signatures.len() < multisig_config.threshold as usize {
+            return Err(Error::InsufficientSignatures);
+        }
+
+        // Verify executor is a signatory
+        if !multisig_config.signatories.contains(&executor) {
+            return Err(Error::InvalidSignatory);
+        }
+
+        // Update protocol fee configuration
+        let mut fee_config: ProtocolFeeConfig = env.storage().instance()
+            .get(&PROTOCOL_FEE_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        fee_config.protocol_fee_bps = proposal.proposed_fee_bps;
+        fee_config.last_updated = current_time;
+        fee_config.updated_by = executor.clone();
+
+        // Mark proposal as executed
+        proposal.executed = true;
+
+        // Store updated configurations
+        env.storage().instance().set(&PROTOCOL_FEE_CONFIG_KEY, &fee_config);
+        env.storage().instance().set(&FEE_PROPOSAL_KEY, &proposal_id, &proposal);
+
+        // Emit event
+        env.events().publish(
+            symbol!("FeeProposalExecuted"),
+            FeeProposalExecutedEvent {
+                proposal_id,
+                new_fee_bps: proposal.proposed_fee_bps,
+                executed_by: executor,
+                executed_at: current_time,
+            },
+        );
+
+        Ok(())
+    }
+
+    // Get current protocol fee configuration
+    pub fn get_protocol_fee_config(env: env::Env) -> Result<ProtocolFeeConfig, Error> {
+        env.storage().instance()
+            .get(&PROTOCOL_FEE_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)
+    }
+
+    // Get multi-signature configuration
+    pub fn get_multisig_config(env: env::Env) -> Result<MultiSigConfig, Error> {
+        env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)
+    }
+
+    // Get fee update proposal
+    pub fn get_fee_proposal(env: env::Env, proposal_id: u64) -> Result<FeeUpdateProposal, Error> {
+        env.storage().instance()
+            .get(&FEE_PROPOSAL_KEY, &proposal_id)
+            .ok_or(Error::InvalidProposal)
+    }
+
+    // Calculate protocol fee for a given amount
+    fn calculate_protocol_fee(env: &env::Env, amount: i64) -> Result<i64, Error> {
+        if let Ok(fee_config) = env.storage().instance().get::<ProtocolFeeConfig>(&PROTOCOL_FEE_CONFIG_KEY) {
+            // Calculate protocol fee: amount * (protocol_fee_bps / 10000)
+            let fee_multiplier = U256::from_u32(fee_config.protocol_fee_bps);
+            let basis_points = U256::from_u32(10000);
+            
+            let fee_amount = U256::from_i64(amount)
+                .checked_mul(fee_multiplier)
+                .and_then(|x| x.checked_div(basis_points))
+                .ok_or(Error::LateFeeCalculationError)?; // Reuse calculation error
+
+            fee_amount.try_into().map_err(|_| Error::LateFeeCalculationError)
+        } else {
+            Ok(0) // No protocol fee if not configured
+        }
+    }
+
+    // Update signatory in multi-sig configuration
+    pub fn update_signatory(
+        env: env::Env,
+        admin: Address,
+        old_signatory: Address,
+        new_signatory: Address,
+    ) -> Result<(), Error> {
+        // Get multi-sig config
+        let mut multisig_config: MultiSigConfig = env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        // Verify admin is a signatory (simple admin check)
+        if !multisig_config.signatories.contains(&admin) {
+            return Err(Error::InvalidSignatory);
+        }
+
+        // Find and replace the old signatory
+        let mut found = false;
+        for i in 0..multisig_config.signatories.len() {
+            if multisig_config.signatories.get(i).unwrap() == &old_signatory {
+                multisig_config.signatories.set(i, new_signatory.clone());
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Err(Error::InvalidSignatory);
+        }
+
+        // Store updated configuration
+        env.storage().instance().set(&MULTISIG_CONFIG_KEY, &multisig_config);
+
+        Ok(())
+    }
+
+    // Emergency function to update protocol fee without multi-sig (for extreme emergencies)
+    // This would require additional governance safeguards in production
+    pub fn emergency_fee_update(
+        env: env::Env,
+        emergency_signer: Address,
+        new_fee_bps: u32,
+        reason: Bytes,
+    ) -> Result<(), Error> {
+        // This function should only be callable by a predefined emergency address
+        // For this implementation, we'll require it to be the first signatory
+        let multisig_config: MultiSigConfig = env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        let first_signatory = multisig_config.signatories.get(0).unwrap();
+        if emergency_signer != *first_signatory {
+            return Err(Error::Unauthorized);
+        }
+
+        // Validate fee bounds
+        if new_fee_bps < multisig_config.min_fee_bps || new_fee_bps > multisig_config.max_fee_bps {
+            return Err(Error::ExceedsMaxFee);
+        }
+
+        // Update fee configuration
+        let mut fee_config: ProtocolFeeConfig = env.storage().instance()
+            .get(&PROTOCOL_FEE_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        fee_config.protocol_fee_bps = new_fee_bps;
+        fee_config.last_updated = env.ledger().timestamp();
+        fee_config.updated_by = emergency_signer;
+
+        // Store updated configuration
+        env.storage().instance().set(&PROTOCOL_FEE_CONFIG_KEY, &fee_config);
+
+        // Emit emergency update event
+        env.events().publish(
+            symbol!("EmergencyFeeUpdate"),
+            FeeProposalExecutedEvent {
+                proposal_id: 0, // Special ID for emergency updates
+                new_fee_bps,
+                executed_by: emergency_signer,
+                executed_at: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
     // Create a new lease
     pub fn create_lease(
         env: env::Env,
@@ -265,6 +724,16 @@ impl LeaseFlowContract {
             }
             if config.staleness_threshold == 0 || config.volatility_threshold == 0 {
                 return Err(Error::InvalidFiatPegConfig);
+            }
+        }
+
+        // Validate late fee rate against protocol limits if multi-sig is initialized
+        if let Ok(multisig_config) = env.storage().instance().get::<MultiSigConfig>(&MULTISIG_CONFIG_KEY) {
+            if late_fee_rate > multisig_config.max_fee_bps {
+                return Err(Error::ExceedsMaxFee);
+            }
+            if late_fee_rate < multisig_config.min_fee_bps {
+                return Err(Error::BelowMinFee);
             }
         }
 
@@ -397,6 +866,10 @@ impl LeaseFlowContract {
         let mut data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
         let mut lease = data.leases.get(lease_id).ok_or(Error::LeaseNotFound)?;
 
+        // Calculate protocol fee on the rent amount
+        let protocol_fee = Self::calculate_protocol_fee(&env, lease.rent_amount)?;
+        let net_rent_amount = lease.rent_amount - protocol_fee;
+
         if amount < lease.rent_amount {
             return Err(Error::InsufficientRentFunds);
         }
@@ -407,7 +880,10 @@ impl LeaseFlowContract {
                 lease.last_rent_payment_timestamp = env.ledger().timestamp();
                 lease.outstanding_balance = 0;
                 lease.accumulated_late_fees = 0;
-                lease.total_paid_rent += amount;
+                lease.total_paid_rent += net_rent_amount;
+
+                // Update escrow vault with protocol fee
+                data.escrow_vault.lessor_treasury += protocol_fee;
             }
             LeaseState::GracePeriod => {
                 // Recovery payment during grace period
@@ -416,13 +892,20 @@ impl LeaseFlowContract {
                     return Err(Error::InsufficientRentFunds);
                 }
 
+                // Calculate protocol fee on total amount
+                let recovery_protocol_fee = Self::calculate_protocol_fee(&env, total_required)?;
+                let net_recovery_amount = total_required - recovery_protocol_fee;
+
                 // Lease recovered
                 lease.state = LeaseState::Active;
                 lease.last_rent_payment_timestamp = env.ledger().timestamp();
                 lease.outstanding_balance = 0;
                 lease.accumulated_late_fees = 0;
                 lease.dunning_start_timestamp = None;
-                lease.total_paid_rent += amount;
+                lease.total_paid_rent += net_recovery_amount;
+
+                // Update escrow vault with protocol fee
+                data.escrow_vault.lessor_treasury += recovery_protocol_fee;
 
                 // Emit recovery event
                 env.events().publish(
@@ -430,7 +913,7 @@ impl LeaseFlowContract {
                     LeaseRecoveredEvent {
                         lease_id,
                         recovery_timestamp: env.ledger().timestamp(),
-                        total_paid: amount,
+                        total_paid: net_recovery_amount,
                         late_fee_paid: lease.accumulated_late_fees,
                     },
                 );
@@ -440,6 +923,19 @@ impl LeaseFlowContract {
 
         data.leases.set(lease_id, lease);
         env.storage().instance().set(&DATA_KEY, &data);
+
+        // Emit protocol fee collection event
+        if protocol_fee > 0 {
+            env.events().publish(
+                symbol!("ProtocolFeeCollected"),
+                FeeProposalExecutedEvent {
+                    proposal_id: lease_id, // Use lease_id as reference
+                    new_fee_bps: protocol_fee as u32,
+                    executed_by: lease.lessee,
+                    executed_at: env.ledger().timestamp(),
+                },
+            );
+        }
 
         Ok(())
     }
@@ -940,5 +1436,587 @@ impl LeaseFlowContract {
         env.storage().instance().set(&DATA_KEY, &data);
 
         Ok(refund_amount)
+    }
+}
+
+//! LeaseFlow – Soroban Smart Contract
+//!
+//! Implements a full lease lifecycle with **event-driven metrics** that emit
+//! a structured event on every state transition so off-chain indexers (e.g.
+//! Stellar Horizon event streaming, Grafana + Prometheus adapters) can trace
+//! each transition in real time without polling contract storage.
+//!
+//! ## State Machine
+//!
+//! ```text
+//!  ┌─────────┐  activate_lease   ┌────────┐
+//!  │ Pending │ ────────────────► │ Active │
+//!  └─────────┘                   └────┬───┘
+//!                                     │
+//!          ┌──────────────────────────┼────────────────────────┐
+//!          │                          │                        │
+//!          ▼                          ▼                        ▼
+//!     ┌──────────┐             ┌──────────┐            ┌──────────┐
+//!     │ Eviction │             │ Defaulted│            │ Disputed │
+//!     └────┬─────┘             └────┬─────┘            └────┬─────┘
+//!          │                        │                        │
+//!          └────────────────────────┴────────────────────────┘
+//!                                   │
+//!                                   ▼
+//!                              ┌────────┐
+//!                              │ Closed │
+//!                              └────────┘
+//! ```
+//!
+//! ## Events Emitted
+//!
+//! Every transition publishes **two topics** (`"lease_transition"`, `<reason>`)
+//! and a `StateTransitionEvent` data payload so indexers can filter by topic.
+
+#![no_std]
+
+use soroban_sdk::{
+    contract, contractimpl, contracttype, symbol_short,
+    Address, Env, String, Symbol,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Data Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Every possible state a lease can occupy.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LeaseState {
+    /// Lease created; waiting for tenant deposit.
+    Pending,
+    /// Deposit received; rent is streaming.
+    Active,
+    /// Funds exhausted before end_date — eviction proceedings started.
+    Eviction,
+    /// Tenant failed to return asset within grace period.
+    Defaulted,
+    /// Landlord disputes the asset-return condition.
+    Disputed,
+    /// Lease fully settled and closed.
+    Closed,
+}
+
+/// On-chain lease record stored under `DataKey::Lease(lease_id)`.
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct Lease {
+    pub lease_id:        u64,
+    pub landlord:        Address,
+    pub tenant:          Address,
+    pub rent_amount:     i128,
+    pub deposit_amount:  i128,
+    pub start_date:      u64,
+    pub end_date:        u64,
+    pub property_uri:    String,
+    pub status:          LeaseState,
+    /// Running total of rent streamed so far.
+    pub streamed_amount: i128,
+    /// Deposit actually paid by the tenant.
+    pub deposit_paid:    i128,
+    /// Ledger sequence when the lease was created.
+    pub created_at:      u64,
+    /// Ledger sequence of the last status update.
+    pub updated_at:      u64,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Event Payload  (the "metric" carried by every transition event)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Structured payload attached to every `lease_transition` event.
+///
+/// Off-chain consumers parse this to build dashboards, alerts, and audit logs.
+///
+/// ```json
+/// {
+///   "lease_id":   42,
+///   "from_state": "Active",
+///   "to_state":   "Eviction",
+///   "timestamp":  1_234_567,
+///   "actor":      "G...",
+///   "reason":     "funds_exhausted"
+/// }
+/// ```
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct StateTransitionEvent {
+    pub lease_id:   u64,
+    pub from_state: LeaseState,
+    pub to_state:   LeaseState,
+    /// Ledger sequence number – wall-clock proxy on Stellar.
+    pub timestamp:  u64,
+    /// Address that triggered the transition.
+    pub actor:      Address,
+    /// Short machine-readable reason code (≤ 8 chars for `symbol_short!`).
+    pub reason:     Symbol,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Aggregate Metrics  (persisted in contract storage)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-transition counters stored under `DataKey::Metrics`.
+///
+/// These let anyone call `get_metrics()` to get a quick health snapshot
+/// without replaying the event stream.
+#[contracttype]
+#[derive(Clone, Debug, Default)]
+pub struct TransitionMetrics {
+    pub total_transitions:    u32,
+    pub pending_to_active:    u32,
+    pub active_to_eviction:   u32,
+    pub active_to_defaulted:  u32,
+    pub active_to_disputed:   u32,
+    pub active_to_closed:     u32,
+    pub eviction_to_closed:   u32,
+    pub disputed_to_closed:   u32,
+    pub defaulted_to_closed:  u32,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Storage Keys
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[contracttype]
+pub enum DataKey {
+    Lease(u64),
+    LeaseCounter,
+    Metrics,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Event Topic Constants
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// Keeping topics as `symbol_short!` (≤ 8 UTF-8 chars) keeps XDR overhead
+// minimal and makes Horizon event filtering cheap.
+
+const TOPIC_TRANSITION: Symbol = symbol_short!("ls_trans");  // lease state transition
+const REASON_ACTIVATED:  Symbol = symbol_short!("activated");
+const REASON_EVICTION:   Symbol = symbol_short!("eviction");
+const REASON_DEFAULTED:  Symbol = symbol_short!("defaulted");
+const REASON_DISPUTED:   Symbol = symbol_short!("disputed");
+const REASON_CLOSED:     Symbol = symbol_short!("closed");
+const REASON_CREATED:    Symbol = symbol_short!("created");
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Contract
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[contract]
+pub struct LeaseFlowContract;
+
+#[contractimpl]
+impl LeaseFlowContract {
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 1. CREATE LEASE
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Landlord creates a lease record. Status starts as `Pending`.
+    ///
+    /// Emits: `("ls_trans", "created")` → `StateTransitionEvent`
+    pub fn create_lease(
+        env:            Env,
+        landlord:       Address,
+        tenant:         Address,
+        rent_amount:    i128,
+        deposit_amount: i128,
+        start_date:     u64,
+        end_date:       u64,
+        property_uri:   String,
+    ) -> u64 {
+        landlord.require_auth();
+
+        let lease_id = Self::next_lease_id(&env);
+        let now = env.ledger().sequence() as u64;
+
+        let lease = Lease {
+            lease_id,
+            landlord: landlord.clone(),
+            tenant: tenant.clone(),
+            rent_amount,
+            deposit_amount,
+            start_date,
+            end_date,
+            property_uri,
+            status:          LeaseState::Pending,
+            streamed_amount: 0,
+            deposit_paid:    0,
+            created_at:      now,
+            updated_at:      now,
+        };
+
+        env.storage().instance().set(&DataKey::Lease(lease_id), &lease);
+
+        // ── EVENT: Pending (initial state recorded as a "creation" transition)
+        Self::emit_transition(
+            &env,
+            lease_id,
+            LeaseState::Pending,   // conceptual "None → Pending"
+            LeaseState::Pending,
+            landlord,
+            REASON_CREATED,
+        );
+
+        lease_id
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 2. ACTIVATE LEASE  (Pending → Active)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Tenant funds the deposit and activates the lease.
+    ///
+    /// Emits: `("ls_trans", "activated")` → `StateTransitionEvent`
+    pub fn activate_lease(
+        env:      Env,
+        lease_id: u64,
+        tenant:   Address,
+        deposit:  i128,
+    ) {
+        tenant.require_auth();
+
+        let mut lease: Lease = Self::load_lease(&env, lease_id);
+
+        assert!(
+            lease.status == LeaseState::Pending,
+            "lease must be Pending to activate"
+        );
+        assert!(
+            deposit >= lease.deposit_amount,
+            "deposit too low"
+        );
+
+        let prev = lease.status.clone();
+        lease.status        = LeaseState::Active;
+        lease.deposit_paid  = deposit;
+        lease.updated_at    = env.ledger().sequence() as u64;
+
+        env.storage().instance().set(&DataKey::Lease(lease_id), &lease);
+
+        // ── EVENT + METRIC: Pending → Active
+        Self::emit_transition(
+            &env, lease_id, prev, LeaseState::Active, tenant.clone(), REASON_ACTIVATED,
+        );
+        Self::increment_metric(&env, |m| { m.pending_to_active += 1; });
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 3. TRIGGER EVICTION  (Active → Eviction)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Called by the landlord when streamed funds are exhausted before `end_date`.
+    ///
+    /// Emits: `("ls_trans", "eviction")` → `StateTransitionEvent`
+    pub fn trigger_eviction(
+        env:      Env,
+        lease_id: u64,
+        landlord: Address,
+    ) {
+        landlord.require_auth();
+
+        let mut lease: Lease = Self::load_lease(&env, lease_id);
+
+        assert!(
+            lease.status == LeaseState::Active,
+            "can only evict an Active lease"
+        );
+        assert!(
+            lease.landlord == landlord,
+            "only the landlord may trigger eviction"
+        );
+
+        let prev = lease.status.clone();
+        lease.status     = LeaseState::Eviction;
+        lease.updated_at = env.ledger().sequence() as u64;
+
+        env.storage().instance().set(&DataKey::Lease(lease_id), &lease);
+
+        // ── EVENT + METRIC: Active → Eviction
+        Self::emit_transition(
+            &env, lease_id, prev, LeaseState::Eviction, landlord, REASON_EVICTION,
+        );
+        Self::increment_metric(&env, |m| { m.active_to_eviction += 1; });
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 4. MARK DEFAULTED  (Active → Defaulted)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Protocol (or landlord) marks the lease Defaulted when the tenant
+    /// fails to call `return_asset` before end_date + grace period.
+    ///
+    /// Emits: `("ls_trans", "defaulted")` → `StateTransitionEvent`
+    pub fn mark_defaulted(
+        env:      Env,
+        lease_id: u64,
+        landlord: Address,
+    ) {
+        landlord.require_auth();
+
+        let mut lease: Lease = Self::load_lease(&env, lease_id);
+
+        assert!(
+            lease.status == LeaseState::Active || lease.status == LeaseState::Eviction,
+            "can only default an Active or Eviction lease"
+        );
+        assert!(
+            lease.landlord == landlord,
+            "only the landlord may mark default"
+        );
+
+        let prev = lease.status.clone();
+        lease.status     = LeaseState::Defaulted;
+        lease.updated_at = env.ledger().sequence() as u64;
+
+        env.storage().instance().set(&DataKey::Lease(lease_id), &lease);
+
+        // ── EVENT + METRIC: * → Defaulted
+        Self::emit_transition(
+            &env, lease_id, prev, LeaseState::Defaulted, landlord, REASON_DEFAULTED,
+        );
+        Self::increment_metric(&env, |m| { m.active_to_defaulted += 1; });
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 5. RAISE DISPUTE  (Active → Disputed)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Landlord disputes the asset-return condition; deposit held in escrow.
+    ///
+    /// Emits: `("ls_trans", "disputed")` → `StateTransitionEvent`
+    pub fn raise_dispute(
+        env:      Env,
+        lease_id: u64,
+        landlord: Address,
+    ) {
+        landlord.require_auth();
+
+        let mut lease: Lease = Self::load_lease(&env, lease_id);
+
+        assert!(
+            lease.status == LeaseState::Active,
+            "can only dispute an Active lease"
+        );
+        assert!(
+            lease.landlord == landlord,
+            "only the landlord may raise a dispute"
+        );
+
+        let prev = lease.status.clone();
+        lease.status     = LeaseState::Disputed;
+        lease.updated_at = env.ledger().sequence() as u64;
+
+        env.storage().instance().set(&DataKey::Lease(lease_id), &lease);
+
+        // ── EVENT + METRIC: Active → Disputed
+        Self::emit_transition(
+            &env, lease_id, prev, LeaseState::Disputed, landlord, REASON_DISPUTED,
+        );
+        Self::increment_metric(&env, |m| { m.active_to_disputed += 1; });
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 6. CLOSE LEASE  (Active | Eviction | Disputed | Defaulted → Closed)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Finalises the lease.  Any authorised party (landlord or tenant based
+    /// on current state) can call this once settlement is complete.
+    ///
+    /// Emits: `("ls_trans", "closed")` → `StateTransitionEvent`
+    pub fn close_lease(
+        env:      Env,
+        lease_id: u64,
+        actor:    Address,
+    ) {
+        actor.require_auth();
+
+        let mut lease: Lease = Self::load_lease(&env, lease_id);
+
+        let allowed = matches!(
+            lease.status,
+            LeaseState::Active
+                | LeaseState::Eviction
+                | LeaseState::Disputed
+                | LeaseState::Defaulted
+        );
+        assert!(allowed, "lease cannot be closed from current state");
+
+        let prev = lease.status.clone();
+        lease.status     = LeaseState::Closed;
+        lease.updated_at = env.ledger().sequence() as u64;
+
+        env.storage().instance().set(&DataKey::Lease(lease_id), &lease);
+
+        // ── EVENT: * → Closed
+        Self::emit_transition(
+            &env, lease_id, prev.clone(), LeaseState::Closed, actor, REASON_CLOSED,
+        );
+
+        // ── METRIC: track which state we closed from
+        Self::increment_metric(&env, |m| {
+            match prev {
+                LeaseState::Active    => m.active_to_closed   += 1,
+                LeaseState::Eviction  => m.eviction_to_closed  += 1,
+                LeaseState::Disputed  => m.disputed_to_closed  += 1,
+                LeaseState::Defaulted => m.defaulted_to_closed += 1,
+                _                     => {}
+            }
+        });
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 7. STREAM RENT  (Active only — updates streamed_amount)
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Advances the rent stream by `amount`.  Called each ledger tick in
+    /// production; called manually in tests.
+    pub fn stream_rent(
+        env:      Env,
+        lease_id: u64,
+        landlord: Address,
+        amount:   i128,
+    ) {
+        landlord.require_auth();
+
+        let mut lease: Lease = Self::load_lease(&env, lease_id);
+
+        assert!(
+            lease.status == LeaseState::Active,
+            "rent can only stream on an Active lease"
+        );
+        assert!(
+            lease.landlord == landlord,
+            "only the landlord can advance the stream"
+        );
+
+        lease.streamed_amount += amount;
+        lease.updated_at       = env.ledger().sequence() as u64;
+
+        // Auto-trigger eviction when funds are exhausted
+        if lease.streamed_amount >= lease.deposit_paid {
+            let prev = lease.status.clone();
+            lease.status = LeaseState::Eviction;
+
+            env.storage().instance().set(&DataKey::Lease(lease_id), &lease);
+
+            // ── EVENT + METRIC: Active → Eviction (funds exhausted)
+            Self::emit_transition(
+                &env,
+                lease_id,
+                prev,
+                LeaseState::Eviction,
+                landlord,
+                REASON_EVICTION,
+            );
+            Self::increment_metric(&env, |m| { m.active_to_eviction += 1; });
+        } else {
+            env.storage().instance().set(&DataKey::Lease(lease_id), &lease);
+        }
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // 8. READ-ONLY HELPERS
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Returns the current state of a lease.
+    pub fn get_lease(env: Env, lease_id: u64) -> Lease {
+        Self::load_lease(&env, lease_id)
+    }
+
+    /// Returns aggregate transition metrics stored in contract instance storage.
+    pub fn get_metrics(env: Env) -> TransitionMetrics {
+        env.storage()
+            .instance()
+            .get(&DataKey::Metrics)
+            .unwrap_or_default()
+    }
+
+    /// Returns the total number of leases ever created.
+    pub fn get_lease_count(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LeaseCounter)
+            .unwrap_or(0u64)
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // Internal Helpers
+    // ──────────────────────────────────────────────────────────────────────
+
+    /// Core event emission helper.
+    ///
+    /// **Topic layout** (Horizon-filterable):
+    /// - topics[0] = `"ls_trans"` — coarse filter "this is a lease transition"
+    /// - topics[1] = `<reason>`  — fine filter e.g. `"eviction"`
+    ///
+    /// **Data**: full `StateTransitionEvent` struct, XDR-serialised by the SDK.
+    fn emit_transition(
+        env:        &Env,
+        lease_id:   u64,
+        from_state: LeaseState,
+        to_state:   LeaseState,
+        actor:      Address,
+        reason:     Symbol,
+    ) {
+        let payload = StateTransitionEvent {
+            lease_id,
+            from_state,
+            to_state,
+            timestamp: env.ledger().sequence() as u64,
+            actor,
+            reason: reason.clone(),
+        };
+
+        // Publish: topics are a tuple, data is the structured payload.
+        // Horizon streams this as a contract event indexed by both topics.
+        env.events().publish(
+            (TOPIC_TRANSITION, reason),
+            payload,
+        );
+    }
+
+    /// Loads `TransitionMetrics`, applies `f`, writes back.
+    fn increment_metric<F>(env: &Env, f: F)
+    where
+        F: FnOnce(&mut TransitionMetrics),
+    {
+        let mut metrics: TransitionMetrics = env
+            .storage()
+            .instance()
+            .get(&DataKey::Metrics)
+            .unwrap_or_default();
+
+        metrics.total_transitions += 1;
+        f(&mut metrics);
+
+        env.storage().instance().set(&DataKey::Metrics, &metrics);
+    }
+
+    /// Loads a lease or panics with a clear message.
+    fn load_lease(env: &Env, lease_id: u64) -> Lease {
+        env.storage()
+            .instance()
+            .get(&DataKey::Lease(lease_id))
+            .expect("lease not found")
+    }
+
+    /// Auto-incrementing lease ID.
+    fn next_lease_id(env: &Env) -> u64 {
+        let id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::LeaseCounter)
+            .unwrap_or(0u64);
+        let next = id + 1;
+        env.storage().instance().set(&DataKey::LeaseCounter, &next);
+        next
     }
 }
