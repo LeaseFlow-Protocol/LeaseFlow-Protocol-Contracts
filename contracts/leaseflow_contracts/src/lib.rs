@@ -34,6 +34,15 @@ pub use timelock_upgrade::TimelockUpgradeModule;
 mod oracle_governance;
 pub use oracle_governance::OracleGovernanceModule;
 
+mod safe_math_128;
+pub use safe_math_128::SafeMath128;
+
+mod enhanced_yield_generation;
+pub use enhanced_yield_generation::EnhancedYieldGenerator;
+
+mod advanced_yield_integration;
+pub use advanced_yield_integration::AdvancedYieldManager;
+
 #[cfg(test)]
 mod governance_tests;
 
@@ -48,6 +57,12 @@ mod derived_access_token_tests;
 
 #[cfg(test)]
 mod mock_rwa_registry;
+
+#[cfg(test)]
+mod safe_math_128_tests;
+
+#[cfg(test)]
+mod performance_benchmarks;
 
 #[cfg(test)]
 mod rwa_registry_tests;
@@ -4106,13 +4121,20 @@ impl LeaseContract {
     }
 
     fn calculate_yield_distribution(total_yield: i128) -> (i128, i128, i128) {
+        let mut safe_math = SafeMath128::new();
+        
+        // Use optimized safe math for yield distribution
         const LESSEE_BPS: u32 = 5000;
         const LESSOR_BPS: u32 = 3000;
         const DAO_BPS: u32 = 2000;
 
-        let lessee_share = total_yield.saturating_mul(LESSEE_BPS as i128) / 10_000;
-        let lessor_share = total_yield.saturating_mul(LESSOR_BPS as i128) / 10_000;
-        let dao_share = total_yield.saturating_mul(DAO_BPS as i128) / 10_000;
+        // Use ceiling division for protocol safety
+        let lessee_share = safe_math.safe_bps_division_ceiling(total_yield, LESSEE_BPS)
+            .unwrap_or(0);
+        let lessor_share = safe_math.safe_bps_division_ceiling(total_yield, LESSOR_BPS)
+            .unwrap_or(0);
+        let dao_share = safe_math.safe_bps_division_ceiling(total_yield, DAO_BPS)
+            .unwrap_or(0);
 
         (lessee_share, lessor_share, dao_share)
     }
@@ -4601,9 +4623,14 @@ impl LeaseContract {
         let yield_client = yield_protocol::YieldClient::new(&env, &yield_protocol);
         let lp_tokens = yield_client.deposit(&env.current_contract_address(), &deploy_amount);
 
-        if lp_tokens
-            < deploy_amount.saturating_mul(10_000i128 - max_slippage_bps as i128) / 10_000i128
-        {
+        // Use optimized safe math for slippage calculation
+        let mut safe_math = SafeMath128::new();
+        let min_expected = safe_math.safe_bps_division_floor(
+            deploy_amount, 
+            10_000 - max_slippage_bps
+        ).map_err(|_| LeaseError::SlippageExceeded)?;
+        
+        if lp_tokens < min_expected {
             return Err(LeaseError::SlippageExceeded);
         }
 
@@ -4654,42 +4681,50 @@ impl LeaseContract {
             return Err(LeaseError::YieldUnderflow);
         }
 
-        let (lessee_share, lessor_share, dao_share) =
-            Self::calculate_yield_distribution(total_yield);
+        // Use enhanced yield generation with optimized math
+        let mut yield_generator = EnhancedYieldGenerator::new();
+        let distribution = yield_generator.calculate_enhanced_distribution(total_yield, None)
+            .map_err(|_| LeaseError::InvalidDeduction)?;
 
         let token_client = token_contract::TokenClient::new(&env, &lease.payment_token);
 
-        if lessee_share > 0 {
+        if distribution.lessee_share > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
                 &lease.tenant,
-                &lessee_share,
+                &distribution.lessee_share,
             );
         }
 
-        if lessor_share > 0 {
+        if distribution.lessor_share > 0 {
             token_client.transfer(
                 &env.current_contract_address(),
                 &lease.landlord,
-                &lessor_share,
+                &distribution.lessor_share,
             );
         }
 
-        if dao_share > 0 {
+        if distribution.dao_share > 0 {
             if let Some(dao_address) = env.storage().instance().get(&DataKey::PlatformFeeRecipient)
             {
-                token_client.transfer(&env.current_contract_address(), &dao_address, &dao_share);
+                token_client.transfer(&env.current_contract_address(), &dao_address, &distribution.dao_share);
             }
         }
 
+        // Use safe math for yield accumulation
+        let mut safe_math = SafeMath128::new();
         let accumulated_yield: i128 = env
             .storage()
             .persistent()
             .get(&DataKey::YieldAccumulated(lease_id))
             .unwrap_or(0);
+        
+        let new_accumulated = safe_math.safe_add_yield(accumulated_yield, total_yield)
+            .map_err(|_| LeaseError::InvalidDeduction)?;
+
         env.storage().persistent().set(
             &DataKey::YieldAccumulated(lease_id),
-            &(accumulated_yield + total_yield),
+            &new_accumulated,
         );
         env.storage().persistent().extend_ttl(
             &DataKey::YieldAccumulated(lease_id),
@@ -4697,12 +4732,19 @@ impl LeaseContract {
             YEAR_IN_LEDGERS,
         );
 
+        // Store precision metrics for monitoring
+        let precision_report = yield_generator.get_performance_report().precision_report;
+        env.storage().temporary().set(
+            &DataKey::YieldAccumulated(lease_id), // Reuse as temp key for metrics
+            &precision_report.cumulative_precision_loss,
+        );
+
         EscrowYieldHarvested {
             lease_id,
             total_yield,
-            lessee_share,
-            lessor_share,
-            dao_share,
+            lessee_share: distribution.lessee_share,
+            lessor_share: distribution.lessor_share,
+            dao_share: distribution.dao_share,
             yield_protocol: deployment.yield_protocol.clone(),
             harvest_timestamp: env.ledger().timestamp(),
         }
@@ -4734,10 +4776,13 @@ impl LeaseContract {
             return Err(LeaseError::YieldUnderflow);
         }
 
-        let min_expected = deployment
-            .principal_amount
-            .saturating_mul(10_000i128 - max_slippage_bps as i128)
-            / 10_000i128;
+        // Use optimized safe math for slippage calculation
+        let mut safe_math = SafeMath128::new();
+        let min_expected = safe_math.safe_bps_division_floor(
+            deployment.principal_amount,
+            10_000 - max_slippage_bps
+        ).map_err(|_| LeaseError::SlippageExceeded)?;
+        
         if withdrawn_amount < min_expected {
             return Err(LeaseError::SlippageExceeded);
         }
