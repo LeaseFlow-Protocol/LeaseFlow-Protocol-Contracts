@@ -34,14 +34,7 @@ pub use timelock_upgrade::TimelockUpgradeModule;
 mod oracle_governance;
 pub use oracle_governance::OracleGovernanceModule;
 
-mod safe_math_128;
-pub use safe_math_128::SafeMath128;
-
-mod enhanced_yield_generation;
-pub use enhanced_yield_generation::EnhancedYieldGenerator;
-
-mod advanced_yield_integration;
-pub use advanced_yield_integration::AdvancedYieldManager;
+pub mod property_attributes;
 
 #[cfg(test)]
 mod governance_tests;
