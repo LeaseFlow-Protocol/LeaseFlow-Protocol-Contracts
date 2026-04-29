@@ -189,15 +189,33 @@ impl VelocityGuard {
         let current_time = env.ledger().timestamp();
         let cutoff_time = current_time - VELOCITY_WINDOW;
         
-        // Remove old timestamps
+        // Remove old timestamps with bounded iteration
         let mut new_termination_times = Vec::new(env);
         let mut count_24h = 0u64;
+        let mut iteration_count = 0u32;
+        
+        // Validate iteration limit
+        let max_iterations = crate::iteration_limits::IterationController::get_limits().max_velocity_tracking;
+        if let Err(_) = crate::iteration_limits::IterationController::validate_velocity_tracking(tracker.last_termination_times.len() as u32) {
+            // Emit warning and use limited processing
+            crate::iteration_limits::IterationUtils::emit_iteration_warning(
+                env, 
+                "cleanup_old_terminations", 
+                tracker.last_termination_times.len() as u32, 
+                max_iterations
+            );
+        }
         
         for timestamp in tracker.last_termination_times.iter() {
+            if iteration_count >= max_iterations {
+                break;
+            }
+            
             if timestamp >= cutoff_time {
                 new_termination_times.push_back(timestamp);
                 count_24h += 1;
             }
+            iteration_count += 1;
         }
         
         tracker.last_termination_times = new_termination_times;
