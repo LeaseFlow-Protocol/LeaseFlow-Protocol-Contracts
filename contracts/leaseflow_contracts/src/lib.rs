@@ -34,6 +34,8 @@ pub use timelock_upgrade::TimelockUpgradeModule;
 mod oracle_governance;
 pub use oracle_governance::OracleGovernanceModule;
 
+pub mod property_attributes;
+
 #[cfg(test)]
 mod governance_tests;
 
