@@ -26,6 +26,12 @@ pub struct OracleConfig {
 // Contract state key
 const DATA_KEY: Symbol = symbol!("DATA");
 
+// Multi-signature configuration keys
+const MULTISIG_CONFIG_KEY: Symbol = symbol!("MULTISIG_CONFIG");
+const PROTOCOL_FEE_CONFIG_KEY: Symbol = symbol!("PROTOCOL_FEE_CONFIG");
+const FEE_PROPOSAL_KEY: Symbol = symbol!("FEE_PROPOSAL");
+const SIGNATURE_KEY: Symbol = symbol!("SIGNATURE");
+
 // Lease states
 #[derive(Copy, Clone, Debug, Eq, PartialEq, contracttype)]
 pub enum LeaseState {
@@ -60,6 +66,18 @@ pub enum Error {
     OracleCallFailed = 18,
     InvalidFiatPegConfig = 19,
     RateLimitExceeded = 20,
+    // Multi-signature validation errors
+    MultiSigNotInitialized = 21,
+    InvalidSignatory = 22,
+    AlreadySigned = 23,
+    InsufficientSignatures = 24,
+    SignatureExpired = 25,
+    InvalidProposal = 26,
+    ProposalAlreadyExecuted = 27,
+    TimelockNotExpired = 28,
+    ExceedsMaxFee = 29,
+    BelowMinFee = 30,
+    InvalidFeeChange = 31,
 }
 
 // Events
@@ -132,6 +150,71 @@ pub struct FiatPeggedRentBilledEvent {
     pub final_crypto_deduction: i64,
     pub billing_timestamp: u64,
     pub asset_address: Address,
+}
+
+// Multi-signature configuration for protocol fee modifications
+#[derive(Clone, Debug, contracttype)]
+pub struct MultiSigConfig {
+    pub signatories: Vec<Address>,
+    pub threshold: u32, // Minimum signatures required
+    pub timelock_period: u64, // Time delay before execution (seconds)
+    pub max_fee_bps: u32, // Maximum protocol fee in basis points
+    pub min_fee_bps: u32, // Minimum protocol fee in basis points
+    pub max_increase_bps: u32, // Maximum increase per update in basis points
+}
+
+// Protocol-wide fee configuration
+#[derive(Clone, Debug, contracttype)]
+pub struct ProtocolFeeConfig {
+    pub protocol_fee_bps: u32, // Current protocol fee in basis points
+    pub last_updated: u64, // Timestamp of last update
+    pub updated_by: Address, // Who made the last update
+}
+
+// Fee update proposal for multi-signature validation
+#[derive(Clone, Debug, contracttype)]
+pub struct FeeUpdateProposal {
+    pub proposal_id: u64,
+    pub proposed_fee_bps: u32,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub execution_time: u64, // When this can be executed (after timelock)
+    pub description: Bytes, // Description of the change
+    pub executed: bool,
+    pub signatures: Vec<Address>, // Addresses that have signed
+}
+
+// Individual signature record
+#[derive(Clone, Debug, contracttype)]
+pub struct SignatureRecord {
+    pub signer: Address,
+    pub proposal_id: u64,
+    pub signed_at: u64,
+    pub signature_data: Bytes, // Optional signature data for off-chain verification
+}
+
+// Events for multi-signature operations
+#[contracttype]
+pub struct FeeProposalCreatedEvent {
+    pub proposal_id: u64,
+    pub proposed_fee_bps: u32,
+    pub proposed_by: Address,
+    pub execution_time: u64,
+}
+
+#[contracttype]
+pub struct FeeProposalSignedEvent {
+    pub proposal_id: u64,
+    pub signer: Address,
+    pub signatures_count: u32,
+}
+
+#[contracttype]
+pub struct FeeProposalExecutedEvent {
+    pub proposal_id: u64,
+    pub new_fee_bps: u32,
+    pub executed_by: Address,
+    pub executed_at: u64,
 }
 
 // Protocol Credit Record for tracking residual debt
@@ -230,6 +313,382 @@ impl LeaseFlowContract {
         env.storage().instance().set(&DATA_KEY, &data);
     }
 
+    // Initialize multi-signature configuration for protocol fee management
+    pub fn initialize_multisig(
+        env: env::Env,
+        signatories: Vec<Address>,
+        threshold: u32,
+        timelock_period: u64,
+        max_fee_bps: u32,
+        min_fee_bps: u32,
+        max_increase_bps: u32,
+        initial_fee_bps: u32,
+    ) -> Result<(), Error> {
+        // Validate inputs
+        if signatories.is_empty() {
+            return Err(Error::InvalidProposal);
+        }
+        if threshold == 0 || threshold > signatories.len() as u32 {
+            return Err(Error::InvalidProposal);
+        }
+        if max_fee_bps <= min_fee_bps {
+            return Err(Error::InvalidFeeChange);
+        }
+        if initial_fee_bps < min_fee_bps || initial_fee_bps > max_fee_bps {
+            return Err(Error::InvalidFeeChange);
+        }
+
+        // Check if already initialized
+        if env.storage().instance().has(&MULTISIG_CONFIG_KEY) {
+            return Err(Error::MultiSigNotInitialized);
+        }
+
+        // Create multi-signature configuration
+        let multisig_config = MultiSigConfig {
+            signatories: signatories.clone(),
+            threshold,
+            timelock_period,
+            max_fee_bps,
+            min_fee_bps,
+            max_increase_bps,
+        };
+
+        // Create initial protocol fee configuration
+        let protocol_fee_config = ProtocolFeeConfig {
+            protocol_fee_bps: initial_fee_bps,
+            last_updated: env.ledger().timestamp(),
+            updated_by: signatories.get(0).unwrap(), // First signatory as initial updater
+        };
+
+        // Store configurations
+        env.storage().instance().set(&MULTISIG_CONFIG_KEY, &multisig_config);
+        env.storage().instance().set(&PROTOCOL_FEE_CONFIG_KEY, &protocol_fee_config);
+
+        Ok(())
+    }
+
+    // Create a fee update proposal
+    pub fn propose_fee_update(
+        env: env::Env,
+        proposer: Address,
+        new_fee_bps: u32,
+        description: Bytes,
+    ) -> Result<u64, Error> {
+        // Verify multi-sig is initialized
+        let multisig_config: MultiSigConfig = env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        // Verify proposer is a signatory
+        if !multisig_config.signatories.contains(&proposer) {
+            return Err(Error::InvalidSignatory);
+        }
+
+        // Get current fee config
+        let current_config: ProtocolFeeConfig = env.storage().instance()
+            .get(&PROTOCOL_FEE_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        // Validate fee bounds
+        if new_fee_bps < multisig_config.min_fee_bps || new_fee_bps > multisig_config.max_fee_bps {
+            return Err(Error::ExceedsMaxFee);
+        }
+
+        // Validate increase limit
+        if new_fee_bps > current_config.protocol_fee_bps {
+            let increase = new_fee_bps.saturating_sub(current_config.protocol_fee_bps);
+            if increase > multisig_config.max_increase_bps {
+                return Err(Error::InvalidFeeChange);
+            }
+        }
+
+        // Generate proposal ID (simple increment)
+        let proposal_id = env.ledger().sequence(); // Use ledger sequence as unique ID
+
+        // Calculate execution time (after timelock)
+        let execution_time = env.ledger().timestamp() + multisig_config.timelock_period;
+
+        // Create proposal
+        let proposal = FeeUpdateProposal {
+            proposal_id,
+            proposed_fee_bps: new_fee_bps,
+            proposed_by: proposer.clone(),
+            proposed_at: env.ledger().timestamp(),
+            execution_time,
+            description,
+            executed: false,
+            signatures: Vec::new(&env),
+        };
+
+        // Store proposal
+        env.storage().instance().set(&FEE_PROPOSAL_KEY, &proposal_id, &proposal);
+
+        // Emit event
+        env.events().publish(
+            symbol!("FeeProposalCreated"),
+            FeeProposalCreatedEvent {
+                proposal_id,
+                proposed_fee_bps: new_fee_bps,
+                proposed_by: proposer,
+                execution_time,
+            },
+        );
+
+        Ok(proposal_id)
+    }
+
+    // Sign a fee update proposal
+    pub fn sign_fee_proposal(
+        env: env::Env,
+        signer: Address,
+        proposal_id: u64,
+    ) -> Result<(), Error> {
+        // Verify multi-sig is initialized
+        let multisig_config: MultiSigConfig = env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        // Verify signer is a signatory
+        if !multisig_config.signatories.contains(&signer) {
+            return Err(Error::InvalidSignatory);
+        }
+
+        // Get proposal
+        let mut proposal: FeeUpdateProposal = env.storage().instance()
+            .get(&FEE_PROPOSAL_KEY, &proposal_id)
+            .ok_or(Error::InvalidProposal)?;
+
+        // Check if proposal is already executed
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        // Check if already signed
+        if proposal.signatures.contains(&signer) {
+            return Err(Error::AlreadySigned);
+        }
+
+        // Add signature
+        proposal.signatures.push_back(signer.clone());
+
+        // Create signature record
+        let signature_record = SignatureRecord {
+            signer: signer.clone(),
+            proposal_id,
+            signed_at: env.ledger().timestamp(),
+            signature_data: Bytes::new(&env),
+        };
+
+        // Store updated proposal and signature record
+        env.storage().instance().set(&FEE_PROPOSAL_KEY, &proposal_id, &proposal);
+        env.storage().instance().set(&SIGNATURE_KEY, &proposal_id, &signer, &signature_record);
+
+        // Emit event
+        env.events().publish(
+            symbol!("FeeProposalSigned"),
+            FeeProposalSignedEvent {
+                proposal_id,
+                signer,
+                signatures_count: proposal.signatures.len() as u32,
+            },
+        );
+
+        Ok(())
+    }
+
+    // Execute a fee update proposal
+    pub fn execute_fee_update(
+        env: env::Env,
+        executor: Address,
+        proposal_id: u64,
+    ) -> Result<(), Error> {
+        // Verify multi-sig is initialized
+        let multisig_config: MultiSigConfig = env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        // Get proposal
+        let mut proposal: FeeUpdateProposal = env.storage().instance()
+            .get(&FEE_PROPOSAL_KEY, &proposal_id)
+            .ok_or(Error::InvalidProposal)?;
+
+        // Check if already executed
+        if proposal.executed {
+            return Err(Error::ProposalAlreadyExecuted);
+        }
+
+        // Check timelock
+        let current_time = env.ledger().timestamp();
+        if current_time < proposal.execution_time {
+            return Err(Error::TimelockNotExpired);
+        }
+
+        // Check signature threshold
+        if proposal.signatures.len() < multisig_config.threshold as usize {
+            return Err(Error::InsufficientSignatures);
+        }
+
+        // Verify executor is a signatory
+        if !multisig_config.signatories.contains(&executor) {
+            return Err(Error::InvalidSignatory);
+        }
+
+        // Update protocol fee configuration
+        let mut fee_config: ProtocolFeeConfig = env.storage().instance()
+            .get(&PROTOCOL_FEE_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        fee_config.protocol_fee_bps = proposal.proposed_fee_bps;
+        fee_config.last_updated = current_time;
+        fee_config.updated_by = executor.clone();
+
+        // Mark proposal as executed
+        proposal.executed = true;
+
+        // Store updated configurations
+        env.storage().instance().set(&PROTOCOL_FEE_CONFIG_KEY, &fee_config);
+        env.storage().instance().set(&FEE_PROPOSAL_KEY, &proposal_id, &proposal);
+
+        // Emit event
+        env.events().publish(
+            symbol!("FeeProposalExecuted"),
+            FeeProposalExecutedEvent {
+                proposal_id,
+                new_fee_bps: proposal.proposed_fee_bps,
+                executed_by: executor,
+                executed_at: current_time,
+            },
+        );
+
+        Ok(())
+    }
+
+    // Get current protocol fee configuration
+    pub fn get_protocol_fee_config(env: env::Env) -> Result<ProtocolFeeConfig, Error> {
+        env.storage().instance()
+            .get(&PROTOCOL_FEE_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)
+    }
+
+    // Get multi-signature configuration
+    pub fn get_multisig_config(env: env::Env) -> Result<MultiSigConfig, Error> {
+        env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)
+    }
+
+    // Get fee update proposal
+    pub fn get_fee_proposal(env: env::Env, proposal_id: u64) -> Result<FeeUpdateProposal, Error> {
+        env.storage().instance()
+            .get(&FEE_PROPOSAL_KEY, &proposal_id)
+            .ok_or(Error::InvalidProposal)
+    }
+
+    // Calculate protocol fee for a given amount
+    fn calculate_protocol_fee(env: &env::Env, amount: i64) -> Result<i64, Error> {
+        if let Ok(fee_config) = env.storage().instance().get::<ProtocolFeeConfig>(&PROTOCOL_FEE_CONFIG_KEY) {
+            // Calculate protocol fee: amount * (protocol_fee_bps / 10000)
+            let fee_multiplier = U256::from_u32(fee_config.protocol_fee_bps);
+            let basis_points = U256::from_u32(10000);
+            
+            let fee_amount = U256::from_i64(amount)
+                .checked_mul(fee_multiplier)
+                .and_then(|x| x.checked_div(basis_points))
+                .ok_or(Error::LateFeeCalculationError)?; // Reuse calculation error
+
+            fee_amount.try_into().map_err(|_| Error::LateFeeCalculationError)
+        } else {
+            Ok(0) // No protocol fee if not configured
+        }
+    }
+
+    // Update signatory in multi-sig configuration
+    pub fn update_signatory(
+        env: env::Env,
+        admin: Address,
+        old_signatory: Address,
+        new_signatory: Address,
+    ) -> Result<(), Error> {
+        // Get multi-sig config
+        let mut multisig_config: MultiSigConfig = env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        // Verify admin is a signatory (simple admin check)
+        if !multisig_config.signatories.contains(&admin) {
+            return Err(Error::InvalidSignatory);
+        }
+
+        // Find and replace the old signatory
+        let mut found = false;
+        for i in 0..multisig_config.signatories.len() {
+            if multisig_config.signatories.get(i).unwrap() == &old_signatory {
+                multisig_config.signatories.set(i, new_signatory.clone());
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            return Err(Error::InvalidSignatory);
+        }
+
+        // Store updated configuration
+        env.storage().instance().set(&MULTISIG_CONFIG_KEY, &multisig_config);
+
+        Ok(())
+    }
+
+    // Emergency function to update protocol fee without multi-sig (for extreme emergencies)
+    // This would require additional governance safeguards in production
+    pub fn emergency_fee_update(
+        env: env::Env,
+        emergency_signer: Address,
+        new_fee_bps: u32,
+        reason: Bytes,
+    ) -> Result<(), Error> {
+        // This function should only be callable by a predefined emergency address
+        // For this implementation, we'll require it to be the first signatory
+        let multisig_config: MultiSigConfig = env.storage().instance()
+            .get(&MULTISIG_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        let first_signatory = multisig_config.signatories.get(0).unwrap();
+        if emergency_signer != *first_signatory {
+            return Err(Error::Unauthorized);
+        }
+
+        // Validate fee bounds
+        if new_fee_bps < multisig_config.min_fee_bps || new_fee_bps > multisig_config.max_fee_bps {
+            return Err(Error::ExceedsMaxFee);
+        }
+
+        // Update fee configuration
+        let mut fee_config: ProtocolFeeConfig = env.storage().instance()
+            .get(&PROTOCOL_FEE_CONFIG_KEY)
+            .ok_or(Error::MultiSigNotInitialized)?;
+
+        fee_config.protocol_fee_bps = new_fee_bps;
+        fee_config.last_updated = env.ledger().timestamp();
+        fee_config.updated_by = emergency_signer;
+
+        // Store updated configuration
+        env.storage().instance().set(&PROTOCOL_FEE_CONFIG_KEY, &fee_config);
+
+        // Emit emergency update event
+        env.events().publish(
+            symbol!("EmergencyFeeUpdate"),
+            FeeProposalExecutedEvent {
+                proposal_id: 0, // Special ID for emergency updates
+                new_fee_bps,
+                executed_by: emergency_signer,
+                executed_at: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
     // Create a new lease
     pub fn create_lease(
         env: env::Env,
@@ -259,6 +718,16 @@ impl LeaseFlowContract {
             }
             if config.staleness_threshold == 0 || config.volatility_threshold == 0 {
                 return Err(Error::InvalidFiatPegConfig);
+            }
+        }
+
+        // Validate late fee rate against protocol limits if multi-sig is initialized
+        if let Ok(multisig_config) = env.storage().instance().get::<MultiSigConfig>(&MULTISIG_CONFIG_KEY) {
+            if late_fee_rate > multisig_config.max_fee_bps {
+                return Err(Error::ExceedsMaxFee);
+            }
+            if late_fee_rate < multisig_config.min_fee_bps {
+                return Err(Error::BelowMinFee);
             }
         }
 
@@ -391,6 +860,10 @@ impl LeaseFlowContract {
         let mut data: ContractData = env.storage().instance().get(&DATA_KEY).unwrap();
         let mut lease = data.leases.get(lease_id).ok_or(Error::LeaseNotFound)?;
 
+        // Calculate protocol fee on the rent amount
+        let protocol_fee = Self::calculate_protocol_fee(&env, lease.rent_amount)?;
+        let net_rent_amount = lease.rent_amount - protocol_fee;
+
         if amount < lease.rent_amount {
             return Err(Error::InsufficientRentFunds);
         }
@@ -401,7 +874,10 @@ impl LeaseFlowContract {
                 lease.last_rent_payment_timestamp = env.ledger().timestamp();
                 lease.outstanding_balance = 0;
                 lease.accumulated_late_fees = 0;
-                lease.total_paid_rent += amount;
+                lease.total_paid_rent += net_rent_amount;
+
+                // Update escrow vault with protocol fee
+                data.escrow_vault.lessor_treasury += protocol_fee;
             }
             LeaseState::GracePeriod => {
                 // Recovery payment during grace period
@@ -410,13 +886,20 @@ impl LeaseFlowContract {
                     return Err(Error::InsufficientRentFunds);
                 }
 
+                // Calculate protocol fee on total amount
+                let recovery_protocol_fee = Self::calculate_protocol_fee(&env, total_required)?;
+                let net_recovery_amount = total_required - recovery_protocol_fee;
+
                 // Lease recovered
                 lease.state = LeaseState::Active;
                 lease.last_rent_payment_timestamp = env.ledger().timestamp();
                 lease.outstanding_balance = 0;
                 lease.accumulated_late_fees = 0;
                 lease.dunning_start_timestamp = None;
-                lease.total_paid_rent += amount;
+                lease.total_paid_rent += net_recovery_amount;
+
+                // Update escrow vault with protocol fee
+                data.escrow_vault.lessor_treasury += recovery_protocol_fee;
 
                 // Emit recovery event
                 env.events().publish(
@@ -424,7 +907,7 @@ impl LeaseFlowContract {
                     LeaseRecoveredEvent {
                         lease_id,
                         recovery_timestamp: env.ledger().timestamp(),
-                        total_paid: amount,
+                        total_paid: net_recovery_amount,
                         late_fee_paid: lease.accumulated_late_fees,
                     },
                 );
@@ -434,6 +917,19 @@ impl LeaseFlowContract {
 
         data.leases.set(lease_id, lease);
         env.storage().instance().set(&DATA_KEY, &data);
+
+        // Emit protocol fee collection event
+        if protocol_fee > 0 {
+            env.events().publish(
+                symbol!("ProtocolFeeCollected"),
+                FeeProposalExecutedEvent {
+                    proposal_id: lease_id, // Use lease_id as reference
+                    new_fee_bps: protocol_fee as u32,
+                    executed_by: lease.lessee,
+                    executed_at: env.ledger().timestamp(),
+                },
+            );
+        }
 
         Ok(())
     }

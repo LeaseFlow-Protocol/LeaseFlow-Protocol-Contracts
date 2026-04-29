@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test {
-    use soroban_sdk::{Address, Bytes, Env};
-    use crate::{LeaseFlowContract, LeaseState, Error, Lease, EscrowVault, ProtocolCreditRecord};
+    use soroban_sdk::{Address, Bytes, Env, Vec};
+    use crate::{LeaseFlowContract, LeaseState, Error, Lease, EscrowVault, ProtocolCreditRecord, MultiSigConfig, ProtocolFeeConfig, FeeUpdateProposal};
 
     #[test]
     fn test_lease_creation_and_states() {
@@ -1157,5 +1157,382 @@ mod test {
             );
             result.try_into()
         }
+    }
+
+    // Multi-signature fee validation tests
+    #[test]
+    fn test_initialize_multisig() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract
+        client.initialize();
+
+        // Create signatories
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        let signatory3 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+        signatories.push_back(signatory3.clone());
+
+        // Initialize multi-sig configuration
+        client.initialize_multisig(
+            &signatories,
+            &2, // threshold of 2 signatures
+            &86400, // 24 hour timelock
+            &3000, // max 30% fee
+            &100, // min 1% fee
+            &500, // max 5% increase per update
+            &200, // initial 2% fee
+        );
+
+        // Verify configuration
+        let config = client.get_multisig_config();
+        assert_eq!(config.threshold, 2);
+        assert_eq!(config.timelock_period, 86400);
+        assert_eq!(config.signatories.len(), 3);
+
+        // Verify protocol fee configuration
+        let fee_config = client.get_protocol_fee_config();
+        assert_eq!(fee_config.protocol_fee_bps, 200);
+        assert_eq!(fee_config.updated_by, signatory1);
+    }
+
+    #[test]
+    fn test_propose_fee_update() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &86400,
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Propose fee update
+        let description = Bytes::from_slice(&env, b"Increase fee to 3%");
+        let proposal_id = client.propose_fee_update(
+            &signatory1,
+            &300, // 3% fee
+            &description,
+        );
+
+        // Verify proposal
+        let proposal = client.get_fee_proposal(&proposal_id);
+        assert_eq!(proposal.proposed_fee_bps, 300);
+        assert_eq!(proposal.proposed_by, signatory1);
+        assert!(!proposal.executed);
+        assert_eq!(proposal.signatures.len(), 0);
+    }
+
+    #[test]
+    fn test_sign_fee_proposal() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &86400,
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Create and sign proposal
+        let description = Bytes::from_slice(&env, b"Increase fee to 3%");
+        let proposal_id = client.propose_fee_update(&signatory1, &300, &description);
+        
+        // First signature
+        client.sign_fee_proposal(&signatory1, &proposal_id);
+        let proposal = client.get_fee_proposal(&proposal_id);
+        assert_eq!(proposal.signatures.len(), 1);
+        assert!(proposal.signatures.contains(&signatory1));
+
+        // Second signature
+        client.sign_fee_proposal(&signatory2, &proposal_id);
+        let proposal = client.get_fee_proposal(&proposal_id);
+        assert_eq!(proposal.signatures.len(), 2);
+        assert!(proposal.signatures.contains(&signatory2));
+
+        // Test double-signing prevention
+        let result = client.try_sign_fee_proposal(&signatory1, &proposal_id);
+        assert_eq!(result, Err(Error::AlreadySigned));
+    }
+
+    #[test]
+    fn test_execute_fee_update() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &1, // 1 second timelock for testing
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Create, sign, and execute proposal
+        let description = Bytes::from_slice(&env, b"Increase fee to 3%");
+        let proposal_id = client.propose_fee_update(&signatory1, &300, &description);
+        
+        client.sign_fee_proposal(&signatory1, &proposal_id);
+        client.sign_fee_proposal(&signatory2, &proposal_id);
+
+        // Wait for timelock
+        env.ledger().set_timestamp(env.ledger().timestamp() + 2);
+
+        // Execute proposal
+        client.execute_fee_update(&signatory1, &proposal_id);
+
+        // Verify fee was updated
+        let fee_config = client.get_protocol_fee_config();
+        assert_eq!(fee_config.protocol_fee_bps, 300);
+        assert_eq!(fee_config.updated_by, signatory1);
+
+        // Verify proposal is marked as executed
+        let proposal = client.get_fee_proposal(&proposal_id);
+        assert!(proposal.executed);
+    }
+
+    #[test]
+    fn test_fee_validation_limits() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &1,
+            &86400,
+            &3000, // max 30%
+            &100,  // min 1%
+            &500,  // max 5% increase
+            &200,  // initial 2%
+        );
+
+        // Test exceeding max fee
+        let description = Bytes::from_slice(&env, b"Excessive fee");
+        let result = client.try_propose_fee_update(&signatory1, &4000, &description);
+        assert_eq!(result, Err(Error::ExceedsMaxFee));
+
+        // Test below min fee
+        let result = client.try_propose_fee_update(&signatory1, &50, &description);
+        assert_eq!(result, Err(Error::BelowMinFee));
+
+        // Test exceeding increase limit
+        let result = client.try_propose_fee_update(&signatory1, &800, &description); // 6% increase
+        assert_eq!(result, Err(Error::InvalidFeeChange));
+    }
+
+    #[test]
+    fn test_multisig_authorization() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &86400,
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Test unauthorized proposal
+        let unauthorized = Address::generate(&env);
+        let description = Bytes::from_slice(&env, b"Unauthorized proposal");
+        let result = client.try_propose_fee_update(&unauthorized, &300, &description);
+        assert_eq!(result, Err(Error::InvalidSignatory));
+
+        // Test unauthorized signing
+        let proposal_id = client.propose_fee_update(&signatory1, &300, &description);
+        let result = client.try_sign_fee_proposal(&unauthorized, &proposal_id);
+        assert_eq!(result, Err(Error::InvalidSignatory));
+    }
+
+    #[test]
+    fn test_protocol_fee_integration() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &1,
+            &1,
+            &3000,
+            &100,
+            &500,
+            &500, // 5% protocol fee
+        );
+
+        // Create lease
+        let lessor = Address::generate(&env);
+        let lessee = Address::generate(&env);
+        let property_uri = Bytes::from_slice(&env, b"property_uri");
+        
+        let lease_id = client.create_lease(
+            &lessor,
+            &lessee,
+            &1000, // rent amount
+            &2000, // deposit
+            &1000, // start date
+            &5000, // end date
+            &432000, // grace period
+            &300, // late fee (within protocol limits)
+            &property_uri,
+        );
+
+        // Activate lease
+        client.activate_lease(&lease_id, &lessee);
+
+        // Process rent payment (protocol fee should be deducted)
+        client.process_rent_payment(&lease_id, &1000);
+
+        // Check escrow vault for protocol fee collection
+        let vault = client.get_escrow_vault();
+        let expected_protocol_fee = 1000 * 500 / 10000; // 5% of 1000 = 50
+        assert_eq!(vault.lessor_treasury, expected_protocol_fee);
+    }
+
+    #[test]
+    fn test_emergency_fee_update() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &86400,
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Test emergency update by first signatory
+        let reason = Bytes::from_slice(&env, b"Emergency update");
+        client.emergency_fee_update(&signatory1, &400, &reason);
+
+        // Verify fee was updated
+        let fee_config = client.get_protocol_fee_config();
+        assert_eq!(fee_config.protocol_fee_bps, 400);
+
+        // Test unauthorized emergency update
+        let result = client.try_emergency_fee_update(&signatory2, &500, &reason);
+        assert_eq!(result, Err(Error::Unauthorized));
+    }
+
+    #[test]
+    fn test_update_signatory() {
+        let env = Env::default();
+        let contract_id = env.register_contract(None, LeaseFlowContract);
+        let client = LeaseFlowContractClient::new(&env, &contract_id);
+
+        // Initialize contract and multi-sig
+        client.initialize();
+        
+        let mut signatories = Vec::new(&env);
+        let signatory1 = Address::generate(&env);
+        let signatory2 = Address::generate(&env);
+        signatories.push_back(signatory1.clone());
+        signatories.push_back(signatory2.clone());
+
+        client.initialize_multisig(
+            &signatories,
+            &2,
+            &86400,
+            &3000,
+            &100,
+            &500,
+            &200,
+        );
+
+        // Update signatory
+        let new_signatory = Address::generate(&env);
+        client.update_signatory(&signatory1, &signatory2.clone(), &new_signatory.clone());
+
+        // Verify signatory was updated
+        let config = client.get_multisig_config();
+        assert!(config.signatories.contains(&signatory1));
+        assert!(config.signatories.contains(&new_signatory));
+        assert!(!config.signatories.contains(&signatory2));
     }
 }
