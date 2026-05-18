@@ -639,6 +639,9 @@ fn test_terminate_archived_lease_moves_to_historical() {
     assert_eq!(record.lease, lease);
     assert_eq!(record.terminated_by, landlord);
     assert_eq!(record.terminated_at, END + 1);
+}
+
+#[test]
 #[should_panic(expected = "Lease not found")]
 fn test_get_nonexistent_lease() {
     let env = Env::default();
