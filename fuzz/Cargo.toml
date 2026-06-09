@@ -1,0 +1,19 @@
+[package]
+name = "leaseflow-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+leaseflow_math = { path = "../crates/leaseflow_math" }
+
+[[bin]]
+name = "fuzz_rent_duration"
+path = "fuzz_targets/fuzz_rent_duration.rs"
+test = false
+doc = false
