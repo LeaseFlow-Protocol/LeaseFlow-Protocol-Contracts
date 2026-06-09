@@ -7,11 +7,11 @@ This repository uses the recommended structure for a Soroban project:
 ```text
 .
 ├── contracts
-│   └── hello_world
-│       ├── src
-│       │   ├── lib.rs
-│       │   └── test.rs
-│       └── Cargo.toml
+│   └── hello_world
+│       ├── src
+│       │   ├── lib.rs
+│       │   └── test.rs
+│       └── Cargo.toml
 ├── Cargo.toml
 └── README.md
 ```
@@ -93,3 +93,201 @@ sequenceDiagram
 
 - **Landlord disputes the return condition** — If the landlord rejects the asset return (e.g. damage claim), the lease enters a `Disputed` state. The deposit is held in escrow until the dispute is resolved — either by on-chain arbitration logic or a manual settlement call. See `test_deposit_release_disputed` for the disputed-return snapshot.
 
+---
+
+# LeaseFlow Buyout Feature Implementation Summary
+
+## Overview
+Successfully implemented the buyout option feature for the LeaseFlow protocol contracts as specified in the GitHub issue.
+
+## Acceptance Criteria Met
+
+### ✅ Add buyout_price to Lease struct
+- Added `buyout_price: Option<i128>` field to both `Lease` and `LeaseInstance` structs
+- Allows setting an optional price at which the tenant can buy out the asset
+
+### ✅ Track cumulative_payments
+- Added `cumulative_payments: i128` field to both lease structs
+- Updated `pay_rent` function to track cumulative payments
+- Added `pay_lease_instance_rent` function for LeaseInstance payments
+
+### ✅ If target hit, execute transfer
+- Implemented automatic ownership transfer when `cumulative_payments >= buyout_price`
+- Transfers NFT ownership (if present) from landlord to tenant
+- Sets lease status to `Terminated` and archives the lease
+- Works for both simple leases and LeaseInstance contracts
+
+## New Functions Added
+
+### For Simple Leases:
+- `set_buyout_price(env, lease_id, landlord, buyout_price)` - Sets buyout price (landlord only)
+- Updated `pay_rent()` - Now tracks cumulative payments and handles buyout
+
+### For LeaseInstance:
+- `set_lease_instance_buyout_price(env, lease_id, landlord, buyout_price)` - Sets buyout price
+- `pay_lease_instance_rent(env, lease_id, payment_amount)` - Processes payments with buyout logic
+
+## Key Features
+
+1. **Authorization**: Only landlords can set buyout prices
+2. **Validation**: Buyout prices must be positive
+3. **Automatic Transfer**: When cumulative payments reach buyout price, ownership transfers automatically
+4. **NFT Support**: If lease has associated NFT, it's transferred to tenant upon buyout
+5. **Archiving**: Leases are archived to historical storage after buyout
+6. **Backward Compatibility**: All existing functionality preserved
+
+## Test Coverage
+
+Added comprehensive tests covering:
+- Setting buyout prices
+- Authorization checks
+- Buyout execution for simple leases
+- Buyout execution for LeaseInstance contracts
+- Cases where buyout price is not reached
+- Lease archiving after buyout
+
+## Usage Example
+
+```rust
+// Create lease
+client.create_lease(&landlord, &tenant, &1000i128);
+
+// Set buyout price (landlord only)
+client.set_buyout_price(&lease_id, &landlord, &5000i128);
+
+// Make payments
+client.pay_rent(&lease_id, &2000i128);
+client.pay_rent(&lease_id, &3000i128); // This triggers buyout
+
+// Lease is now terminated, ownership transferred to tenant
+```
+
+## Security Considerations
+
+- Buyout can only be set by landlord
+- Automatic transfer prevents manual intervention errors
+- Leases are properly archived after buyout
+- All existing security checks maintained
+
+## Files Modified
+
+- `contracts/leaseflow_contracts/src/lib.rs` - Main implementation
+- `contracts/leaseflow_contracts/src/test.rs` - Test coverage
+
+The implementation fully satisfies the requirements and provides a robust buyout mechanism for the LeaseFlow protocol.
+
+---
+
+# Frontend Event Integration
+
+This document describes the events that the LeaseFlow Protocol Contracts emit to notify the frontend when assets become available or change state.
+
+## New Events
+
+### 1. LeaseStarted
+Emitted when a lease is activated and the asset becomes available to the renter.
+
+**Event Structure:**
+```rust
+pub struct LeaseStarted {
+    pub id: u64,        // Timestamp-based unique ID
+    pub renter: Address, // Address of the renter/tenant
+    pub rate: i128,     // Per-second rent rate
+}
+```
+
+**When emitted:** When `activate_lease` is called successfully.
+
+**Frontend use case:** Show that an asset is now available for use by the renter.
+
+### 2. LeaseEnded
+Emitted when a lease terminates, providing payment summary information.
+
+**Event Structure:**
+```rust
+pub struct LeaseEnded {
+    pub id: u64,         // Lease ID
+    pub duration: u64,   // Total lease duration in seconds
+    pub total_paid: i128, // Total amount paid during lease
+}
+```
+
+**When emitted:** When `terminate_lease` is called successfully.
+
+**Frontend use case:** Update UI to show lease completion and payment summary.
+
+### 3. AssetReclaimed
+Emitted when an asset is reclaimed by the landlord or system.
+
+**Event Structure:**
+```rust
+pub struct AssetReclaimed {
+    pub id: u64,        // Lease ID
+    pub reason: String, // Reason for reclamation
+}
+```
+
+**When emitted:** When `reclaim_asset` is called successfully.
+
+**Frontend use case:** Notify that an asset is no longer available and show the reason.
+
+## Integration Guide
+
+### Listening to Events
+
+Frontend applications should listen to these events using the Stellar Soroban SDK event listeners:
+
+```javascript
+// Example: Listen to LeaseStarted events
+contract.events().on('LeaseStarted', (event) => {
+    const { id, renter, rate } = event.data;
+    // Update UI to show asset is available
+    updateAssetAvailability(id, renter, rate);
+});
+
+// Example: Listen to LeaseEnded events  
+contract.events().on('LeaseEnded', (event) => {
+    const { id, duration, total_paid } = event.data;
+    // Update UI to show lease completion
+    showLeaseSummary(id, duration, total_paid);
+});
+
+// Example: Listen to AssetReclaimed events
+contract.events().on('AssetReclaimed', (event) => {
+    const { id, reason } = event.data;
+    // Update UI to show asset is no longer available
+    markAssetUnavailable(id, reason);
+});
+```
+
+### Event Filtering
+
+Events can be filtered by specific lease IDs or addresses:
+
+```javascript
+// Listen to events for a specific lease
+contract.events()
+    .filter({ lease_id: specificLeaseId })
+    .on('LeaseStarted', handleLeaseStarted);
+
+// Listen to events for a specific renter
+contract.events()
+    .filter({ renter: userAddress })
+    .on('LeaseStarted', handleUserLeaseStarted);
+```
+
+## Testing
+
+The contract includes comprehensive tests for all events. Run tests with:
+
+```bash
+make test
+# or
+stellar contract test
+```
+
+## Migration Notes
+
+These events are additive and do not affect existing contract functionality. Existing integrations will continue to work unchanged.
+
+The new `reclaim_asset` function provides a dedicated way to emit asset reclamation events, which can be called by landlords, tenants, or system administrators.
