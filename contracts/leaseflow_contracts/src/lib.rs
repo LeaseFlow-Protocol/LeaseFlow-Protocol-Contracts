@@ -1,4 +1,5 @@
 #![no_std]
+#![allow(clippy::too_many_arguments)]
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, symbol_short, Address,
     BytesN, Env, String, Symbol,
@@ -37,16 +38,16 @@ macro_rules! require {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RateType {
-    PerSecond,
-    PerHour,
-    PerDay,
+    Second,
+    Hour,
+    Day,
 }
 
 pub fn to_per_second(rate: i128, rate_type: RateType) -> i128 {
     match rate_type {
-        RateType::PerSecond => rate,
-        RateType::PerHour => rate / 3_600,
-        RateType::PerDay => rate / 86_400,
+        RateType::Second => rate,
+        RateType::Hour => rate / 3_600,
+        RateType::Day => rate / 86_400,
     }
 }
 
@@ -274,6 +275,7 @@ pub fn save_lease(env: &Env, lease_id: &Symbol, lease: &LeaseInstance) {
 mod nft_contract {
     use soroban_sdk::{contractclient, Address, Env};
     #[contractclient(name = "NftClient")]
+    #[allow(dead_code)]
     pub trait NftInterface {
         fn transfer_from(env: Env, spender: Address, from: Address, to: Address, token_id: u128);
     }
@@ -690,7 +692,7 @@ impl LeaseContract {
         caller.require_auth();
 
         // Emit AssetReclaimed event
-        let event_id = env.ledger().timestamp() as u64;
+        let event_id = env.ledger().timestamp();
         AssetReclaimed {
             id: event_id,
             reason: reason.clone(),
